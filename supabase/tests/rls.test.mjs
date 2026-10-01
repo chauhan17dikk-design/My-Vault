@@ -17,6 +17,8 @@ alter default privileges in schema public grant all on functions to anon, authen
 create table auth.users (id uuid primary key, email text, raw_user_meta_data jsonb default '{}');
 create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
 grant execute on function auth.uid() to anon, authenticated;
+create function auth.jwt() returns jsonb language sql stable as $$ select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb $$;
+grant execute on function auth.jwt() to anon, authenticated;
 create table storage.buckets (id text primary key, name text, public boolean, file_size_limit bigint, allowed_mime_types text[]);
 create table storage.objects (id uuid primary key default gen_random_uuid(), bucket_id text, name text);
 alter table storage.objects enable row level security;
@@ -43,8 +45,10 @@ await db.exec(`insert into auth.users (id, email, raw_user_meta_data) values ('$
 
 let pass = 0;
 let fail = 0;
-const as = async (uid, role = 'authenticated') => {
-  await db.exec(`reset role; select set_config('request.jwt.claim.sub', '${uid ?? ''}', false); set role ${role};`);
+// aal2 = signed in with password + authenticator code; aal1 = password only.
+const as = async (uid, role = 'authenticated', aal = 'aal2') => {
+  const claims = uid ? JSON.stringify({ sub: uid, role, aal }) : '';
+  await db.exec(`reset role; select set_config('request.jwt.claim.sub', '${uid ?? ''}', false); select set_config('request.jwt.claims', '${claims}', false); set role ${role};`);
 };
 async function expectOk(name, sql, check) {
   try {
@@ -155,6 +159,22 @@ await expectOk('B cannot read A video object even with the exact path', `select 
 await expectOk('B cannot overwrite A video object', `update storage.objects set name='${B}/videos/stolen.mov' where name='${A}/videos/${V}.mov' returning id`, (r) => r.rows.length === 0);
 await expectOk('B cannot delete A video object', `delete from storage.objects where name='${A}/videos/${V}.mov' returning id`, (r) => r.rows.length === 0);
 await expectOk('B stats show no videos', `select public.vault_stats() s`, (r) => r.rows[0].s.videos === 0);
+
+// ---- Two-step verification: a password-only (aal1) session gets nothing ----
+await as(A, 'authenticated', 'aal1');
+await expectOk('aal1 cannot list own files', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await expectOk('aal1 cannot read own profile', `select count(*)::int n from public.profiles`, (r) => r.rows[0].n === 0);
+await expectOk('aal1 cannot see own storage objects', `select count(*)::int n from storage.objects where bucket_id='vault-files'`, (r) => r.rows[0].n === 0);
+await expectOk('aal1 stats are empty', `select public.vault_stats() s`, (r) => r.rows[0].s.total_files === 0 && r.rows[0].s.quota_bytes === null);
+await expectErr('aal1 cannot insert a file row', `insert into public.files (original_name, display_name, storage_path, category, size_bytes) values ('x','x','${A}/pdfs/aal1.pdf','pdf',1)`, /row-level security/);
+await expectErr('aal1 cannot upload an object', `insert into storage.objects (bucket_id, name) values ('vault-files', '${A}/images/aal1.jpg')`, /row-level security/);
+await expectOk('aal1 cannot rename own files', `update public.files set display_name='pwned' returning id`, (r) => r.rows.length === 0);
+await expectOk('aal1 cannot delete own files', `delete from public.files returning id`, (r) => r.rows.length === 0);
+await expectOk('aal1 cannot delete own objects', `delete from storage.objects returning id`, (r) => r.rows.length === 0);
+await expectOk('aal1 cannot change own profile', `update public.profiles set full_name='pwned' returning id`, (r) => r.rows.length === 0);
+await as(A);
+await expectOk('aal2 still sees own files', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 2);
+await expectOk('aal2 still sees own objects', `select count(*)::int n from storage.objects`, (r) => r.rows[0].n === 3);
 
 await as(null, 'anon');
 await expectOk('anon cannot read A video object even with the exact path', `select count(*)::int n from storage.objects where name='${A}/videos/${V}.mov'`, (r) => r.rows[0].n === 0);

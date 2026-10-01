@@ -18,6 +18,9 @@ export function getErrorMessage(error: unknown, fallback = 'Something went wrong
   if (!navigator.onLine || msg.includes('failed to fetch') || msg.includes('networkerror') || msg.includes('network error'))
     return 'Network error. Check your internet connection and try again.';
   if (msg.includes('invalid login credentials')) return 'Incorrect email or password.';
+  if (msg.includes('invalid totp') || msg.includes('invalid mfa') || (msg.includes('challenge') && msg.includes('expired')))
+    return 'Incorrect or expired code. Enter the current 6-digit code from your authenticator app.';
+  if (msg.includes('aal2')) return 'Enter your authenticator code first.';
   if (msg.includes('email not confirmed')) return 'Please confirm your email address before signing in.';
   if (msg.includes('storage_limit_exceeded')) return 'Storage limit reached. Empty the trash or increase your quota.';
   if (msg.includes('immutable_column')) return 'That property of a file cannot be changed.';

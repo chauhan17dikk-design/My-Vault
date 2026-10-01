@@ -144,6 +144,14 @@ bucket size limit.
    *Authentication → Users*. Every account only ever sees its own files.
 4. **Create your account**: go to *Authentication → Users → Add user → Create new
    user*, enter your email and a strong password, and tick **Auto Confirm User**.
+   **Two-step verification is mandatory.** On your first sign-in the app shows a
+   QR code: scan it with an authenticator app (Google Authenticator, Microsoft
+   Authenticator, Authy) and enter the 6-digit code. Every later sign-in needs
+   the password **and** a code from that phone. The database enforces this too
+   (section 4 of `schema.sql`): a password-only session can't read or change
+   anything. Sign in and set this up right after creating the account. Lost the
+   phone? Delete the factor under *Authentication → Users → your user → MFA
+   factors*, then sign in to scan a new QR code.
 5. **URL configuration** (*Authentication → URL Configuration*):
    - Site URL: your production URL (or `http://localhost:5173` while developing)
    - Redirect URLs: add `http://localhost:5173/**` and `https://YOUR-DOMAIN/**`

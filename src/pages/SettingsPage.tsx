@@ -9,7 +9,7 @@ import { useAuth, useUser } from '@/context/AuthContext';
 import { PAGE_SIZES, useAvatarUrl, useDisplayName, usePreferences, useProfile } from '@/hooks/useProfile';
 import { useStats } from '@/hooks/useFiles';
 import { removeAvatar, updateProfile, uploadAvatar } from '@/services/profile';
-import { supabase } from '@/lib/supabase';
+import { supabase, verifyPassword } from '@/lib/supabase';
 import { getErrorMessage } from '@/lib/errors';
 import { qk, queryClient } from '@/lib/queryClient';
 import { StorageBreakdown } from './StoragePage';
@@ -170,9 +170,9 @@ function SecuritySection() {
     if (next === current) return setError('New password must be different from the current one.');
     setSaving(true);
     try {
-      // Re-verify the current password before allowing a change.
-      const { error: verifyError } = await supabase.auth.signInWithPassword({ email: user.email!, password: current });
-      if (verifyError) throw new Error('Current password is incorrect.');
+      // Re-verify the current password before allowing a change, without
+      // downgrading this two-step-verified session.
+      if (!(await verifyPassword(user.email!, current))) throw new Error('Current password is incorrect.');
       const { error: updateError } = await supabase.auth.updateUser({ password: next });
       if (updateError) throw updateError;
       setCurrent('');
@@ -231,6 +231,10 @@ function SecuritySection() {
       </form>
       <div className="space-y-3 border-t border-line pt-5">
         <h4 className="text-sm font-semibold text-ink">Sessions & recovery</h4>
+        <p className="text-sm text-muted">
+          Two-step verification is always on: every sign-in needs your password and a code from your authenticator app. Lost your phone? Remove the
+          authenticator in Supabase (Authentication → Users → your user → MFA factors), then sign in to set up a new one.
+        </p>
         <div className="flex flex-wrap gap-2">
           <Button variant="secondary" icon={<LogOut className="size-4" />} onClick={() => signOut().catch((e) => toast.error(getErrorMessage(e)))}>
             Sign out of this device
@@ -322,7 +326,7 @@ export function SettingsPage() {
       <Section title="Profile" description="Your name, email and avatar." icon={<Camera className="size-5" />}>
         <ProfileSection />
       </Section>
-      <Section title="Security" description="Password and active sessions." icon={<ShieldCheck className="size-5" />}>
+      <Section title="Security" description="Password, two-step verification and active sessions." icon={<ShieldCheck className="size-5" />}>
         <SecuritySection />
       </Section>
       <Section title="Preferences" description="Synced to your account across devices." icon={<LayoutGrid className="size-5" />}>

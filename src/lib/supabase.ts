@@ -1,4 +1,4 @@
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type Session } from '@supabase/supabase-js';
 import { env } from './env';
 
 const REMEMBER_KEY = 'vault.remember-session';
@@ -83,3 +83,45 @@ export const supabase = createClient(
     },
   },
 );
+
+/**
+ * Authenticator assurance level of a session: 'aal2' only after the
+ * authenticator-app code was verified. Read from the access token's claims,
+ * the same value the database policies check.
+ */
+export function sessionAal(session: Session | null): 'aal1' | 'aal2' | null {
+  if (!session) return null;
+  try {
+    const part = session.access_token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const claims = JSON.parse(atob(part.padEnd(part.length + ((4 - (part.length % 4)) % 4), '='))) as { aal?: string };
+    return claims.aal === 'aal2' ? 'aal2' : 'aal1';
+  } catch {
+    return 'aal1';
+  }
+}
+
+/**
+ * Checks a password without touching the signed-in session. Signing in again
+ * on the main client would replace the verified (aal2) session with an aal1
+ * one, so a throwaway in-memory client is used instead.
+ */
+export async function verifyPassword(email: string, password: string): Promise<boolean> {
+  const memory = new Map<string, string>();
+  const probe = createClient(env.supabaseUrl || 'http://localhost:54321', env.supabaseAnonKey || 'missing-anon-key', {
+    auth: {
+      storageKey: 'vault-password-check',
+      storage: {
+        getItem: (k) => memory.get(k) ?? null,
+        setItem: (k, v) => void memory.set(k, v),
+        removeItem: (k) => void memory.delete(k),
+      },
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+  });
+  const { error } = await probe.auth.signInWithPassword({ email, password });
+  if (error) return false;
+  await probe.auth.signOut({ scope: 'local' });
+  return true;
+}

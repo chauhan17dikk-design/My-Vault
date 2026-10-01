@@ -56,12 +56,16 @@ function Shell() {
   );
 }
 
-/** Protected area: redirects to /login without a verified session. */
+/**
+ * Protected area: redirects to /login without a session and to /verify until
+ * the authenticator code is entered. The database enforces the same aal2 rule.
+ */
 export function AppLayout() {
-  const { session, loading } = useAuth();
+  const { session, aal, loading } = useAuth();
   const location = useLocation();
   if (loading) return <FullPageLoader />;
   if (!session) return <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />;
+  if (aal !== 'aal2') return <Navigate to="/verify" replace state={{ from: location.pathname + location.search }} />;
   return (
     <UploadProvider>
       <FileActionsProvider>

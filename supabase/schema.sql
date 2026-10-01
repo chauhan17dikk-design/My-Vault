@@ -373,3 +373,28 @@ create policy "vault: delete own objects" on storage.objects
     bucket_id = 'vault-files'
     and (storage.foldername(name))[1] = (select auth.uid())::text
   );
+
+-- ---------------------------------------------------------------------
+-- 4. Two-step verification is mandatory
+-- ---------------------------------------------------------------------
+-- A password alone only yields an aal1 session. These RESTRICTIVE policies
+-- are AND-ed with every policy above, so nothing in the vault can be read or
+-- changed until the authenticator-app code is verified (aal2). This holds
+-- even for someone calling the API directly with a stolen password.
+drop policy if exists "profiles: require 2fa" on public.profiles;
+create policy "profiles: require 2fa" on public.profiles
+  as restrictive for all to authenticated
+  using ((select auth.jwt() ->> 'aal') = 'aal2')
+  with check ((select auth.jwt() ->> 'aal') = 'aal2');
+
+drop policy if exists "files: require 2fa" on public.files;
+create policy "files: require 2fa" on public.files
+  as restrictive for all to authenticated
+  using ((select auth.jwt() ->> 'aal') = 'aal2')
+  with check ((select auth.jwt() ->> 'aal') = 'aal2');
+
+drop policy if exists "vault: require 2fa" on storage.objects;
+create policy "vault: require 2fa" on storage.objects
+  as restrictive for all to authenticated
+  using (bucket_id <> 'vault-files' or (select auth.jwt() ->> 'aal') = 'aal2')
+  with check (bucket_id <> 'vault-files' or (select auth.jwt() ->> 'aal') = 'aal2');

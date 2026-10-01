@@ -6,6 +6,7 @@ import { AuthLayout } from '@/layouts/AuthLayout';
 import { Button } from '@/components/ui/Button';
 import { Field, Input } from '@/components/ui/Input';
 import { useAuth } from '@/context/AuthContext';
+import { TwoFactorForm } from '@/components/auth/TwoFactorForm';
 import { clearRecoverySession, isRecoverySession, supabase } from '@/lib/supabase';
 import { getErrorMessage } from '@/lib/errors';
 
@@ -63,7 +64,7 @@ export function ForgotPasswordPage() {
 }
 
 export function ResetPasswordPage() {
-  const { session } = useAuth();
+  const { session, aal } = useAuth();
   const navigate = useNavigate();
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -100,6 +101,11 @@ export function ResetPasswordPage() {
           <Button className="w-full" size="lg" onClick={() => navigate('/forgot-password')}>
             Request new link
           </Button>
+        </div>
+      ) : aal !== 'aal2' ? (
+        <div className="mt-6 space-y-4">
+          <p className="text-sm text-muted">First enter the code from your authenticator app.</p>
+          <TwoFactorForm onVerified={() => undefined} />
         </div>
       ) : (
         <form onSubmit={onSubmit} className="mt-8 space-y-4" noValidate>

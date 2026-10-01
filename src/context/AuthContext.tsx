@@ -1,12 +1,14 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
 import type { Session, User } from '@supabase/supabase-js';
-import { clearRecoverySession, markRecoverySession, setRememberSession, supabase } from '@/lib/supabase';
+import { clearRecoverySession, markRecoverySession, sessionAal, setRememberSession, supabase } from '@/lib/supabase';
 import { queryClient } from '@/lib/queryClient';
 
 interface AuthContextValue {
   session: Session | null;
   user: User | null;
+  /** 'aal2' once the authenticator code was verified for this session. */
+  aal: 'aal1' | 'aal2' | null;
   loading: boolean;
   signIn: (email: string, password: string, remember: boolean) => Promise<void>;
   signOut: (scope?: 'local' | 'global') => Promise<void>;
@@ -57,7 +59,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ session, user: session?.user ?? null, loading, signIn, signOut }),
+    () => ({ session, user: session?.user ?? null, aal: sessionAal(session), loading, signIn, signOut }),
     [session, loading, signIn, signOut],
   );
 

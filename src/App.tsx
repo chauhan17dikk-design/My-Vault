@@ -7,6 +7,7 @@ import { ErrorBoundary } from '@/components/layout/ErrorBoundary';
 import { AppLayout } from '@/layouts/AppLayout';
 import { LoginPage } from '@/pages/LoginPage';
 import { ForgotPasswordPage, ResetPasswordPage } from '@/pages/PasswordPages';
+import { TwoFactorPage } from '@/pages/TwoFactorPage';
 import { DashboardPage } from '@/pages/DashboardPage';
 import { LibraryPage } from '@/pages/LibraryPage';
 import { StoragePage } from '@/pages/StoragePage';
@@ -34,6 +35,7 @@ export default function App() {
         <ErrorBoundary resetKey={location.pathname}>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
+            <Route path="/verify" element={<TwoFactorPage />} />
             <Route path="/forgot-password" element={<ForgotPasswordPage />} />
             <Route path="/reset-password" element={<ResetPasswordPage />} />
             <Route element={<AppLayout />}>
