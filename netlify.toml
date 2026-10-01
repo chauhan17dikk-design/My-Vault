@@ -1,0 +1,12 @@
+# Netlify build settings. package.json must sit in the repository root
+# (next to this file) - do not upload the project as a .zip.
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  # react-router 8 needs Node >= 22.22, pdfjs-dist needs >= 22.13.
+  NODE_VERSION = "22"
+
+# SPA routing and security headers come from public/_redirects and
+# public/_headers, which Vite copies into dist/.
