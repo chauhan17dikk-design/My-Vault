@@ -3,6 +3,7 @@ import { toast } from 'sonner';
 import { useUser } from './AuthContext';
 import { detectCategory } from '@/lib/categories';
 import { getErrorMessage } from '@/lib/errors';
+import { markUploadsInterrupted } from '@/lib/session';
 import { invalidateLibrary, qk, queryClient } from '@/lib/queryClient';
 import { RESUMABLE_THRESHOLD, uploadVaultFile, validateFile } from '@/services/upload';
 import type { Category, UploadItem, VaultStats } from '@/types';
@@ -103,6 +104,17 @@ export function UploadProvider({ children }: { children: ReactNode }) {
   }, [items, run]);
 
   const isUploading = items.some((i) => i.status === 'queued' || isActive(i));
+
+  // The session ended (sign-out or inactivity timeout): stop uploads that are
+  // still running instead of letting them fail against a revoked session.
+  useEffect(() => {
+    const running = controllers.current;
+    return () => {
+      if (!running.size) return;
+      markUploadsInterrupted();
+      running.forEach((c) => c.abort());
+    };
+  }, []);
 
   // Warn before closing the tab mid-upload.
   useEffect(() => {

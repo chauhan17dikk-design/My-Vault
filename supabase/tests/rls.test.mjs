@@ -10,15 +10,15 @@ const schemaV1 = fs.readFileSync(new URL('./fixtures/schema-v1.sql', import.meta
 // ---- Minimal Supabase platform stubs (mirrors Supabase's definitions) ----
 const PLATFORM = `
 create schema auth; create schema storage; create schema extensions;
-create role anon nologin; create role authenticated nologin;
+create role anon nologin; create role authenticated nologin; create role supabase_auth_admin nologin;
 grant usage on schema public, auth, storage, extensions to anon, authenticated;
 alter default privileges in schema public grant all on tables to anon, authenticated;
 alter default privileges in schema public grant all on functions to anon, authenticated;
 create table auth.users (id uuid primary key, email text, raw_user_meta_data jsonb default '{}');
+create table auth.sessions (id uuid primary key, user_id uuid not null, created_at timestamptz not null default now());
 create function auth.uid() returns uuid language sql stable as $$ select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;
-grant execute on function auth.uid() to anon, authenticated;
-create function auth.jwt() returns jsonb language sql stable as $$ select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb $$;
-grant execute on function auth.jwt() to anon, authenticated;
+create function auth.jwt() returns jsonb language sql stable as $$ select coalesce(nullif(current_setting('request.jwt.claim', true), ''), nullif(current_setting('request.jwt.claims', true), ''), '{}')::jsonb $$;
+grant execute on function auth.uid(), auth.jwt() to anon, authenticated;
 create table storage.buckets (id text primary key, name text, public boolean, file_size_limit bigint, allowed_mime_types text[]);
 create table storage.objects (id uuid primary key default gen_random_uuid(), bucket_id text, name text);
 alter table storage.objects enable row level security;
@@ -41,14 +41,21 @@ console.log('schema applied twice OK');
 
 const A = '11111111-1111-1111-1111-111111111111';
 const B = '22222222-2222-2222-2222-222222222222';
+// Each user's signed-in session (the session_id claim in their JWT).
+const SESSION = { [A]: 'a5e55100-0000-4000-8000-000000000001', [B]: 'b5e55100-0000-4000-8000-000000000001' };
+const addSessions = (d) => d.exec(`insert into auth.sessions (id, user_id) values ('${SESSION[A]}','${A}'), ('${SESSION[B]}','${B}')`);
 await db.exec(`insert into auth.users (id, email, raw_user_meta_data) values ('${A}','a@x.com','{"full_name":"Alice"}'), ('${B}','b@x.com','{}')`);
+await addSessions(db);
 
 let pass = 0;
 let fail = 0;
 // aal2 = signed in with password + authenticator code; aal1 = password only.
-const as = async (uid, role = 'authenticated', aal = 'aal2') => {
-  const claims = uid ? JSON.stringify({ sub: uid, role, aal }) : '';
-  await db.exec(`reset role; select set_config('request.jwt.claim.sub', '${uid ?? ''}', false); select set_config('request.jwt.claims', '${claims}', false); set role ${role};`);
+// sid is the session_id claim (the Supabase Auth session).
+const as = async (uid, role = 'authenticated', aal = 'aal2', sid = uid ? SESSION[uid] : null) => {
+  const claims = uid ? JSON.stringify({ sub: uid, role, aal, ...(sid ? { session_id: sid } : {}) }) : '';
+  await db.exec(
+    `reset role; select set_config('request.jwt.claim.sub', '${uid ?? ''}', false), set_config('request.jwt.claims', '${claims}', false); set role ${role};`,
+  );
 };
 async function expectOk(name, sql, check) {
   try {
@@ -197,10 +204,86 @@ await expectOk(
   (r) => r.rows[0].public === false && Number(r.rows[0].file_size_limit) === 5368709120,
 );
 
+// ---- Idle session timeout (9 minutes) ----
+// Separate sessions per scenario so A's main session stays active.
+const S = {
+  idle: 'a5e55100-0000-4000-8000-0000000000a1',
+  recent: 'a5e55100-0000-4000-8000-0000000000a2',
+  old: 'a5e55100-0000-4000-8000-0000000000a3',
+  revoked: 'a5e55100-0000-4000-8000-0000000000a4',
+};
+await db.exec('reset role');
+await db.exec(`insert into auth.sessions (id, user_id, created_at) values
+  ('${S.idle}','${A}', now() - interval '1 hour'), ('${S.recent}','${A}', now() - interval '1 hour'),
+  ('${S.old}','${A}', now() - interval '10 minutes'), ('${S.revoked}','${A}', now())`);
+await db.exec(`insert into public.session_activity (session_id, user_id, last_seen_at) values ('${S.idle}','${A}', now() - interval '1 minute')`);
+
+await as(A, 'authenticated', 'aal2', S.idle);
+await expectOk('recently active session can read', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
+await expectOk('touch_session records activity', `select public.touch_session()`);
+await db.exec('reset role');
+await expectOk('activity row updated for the JWT session', `select (last_seen_at > now() - interval '5 seconds') fresh from public.session_activity where session_id='${S.idle}'`, (r) => r.rows[0]?.fresh === true);
+await db.exec(`update public.session_activity set last_seen_at = now() - interval '9 minutes 1 second' where session_id='${S.idle}'`);
+await db.exec(`insert into public.session_activity (session_id, user_id, last_seen_at) values ('${S.recent}','${A}', now() - interval '8 minutes 50 seconds')`);
+
+await as(A, 'authenticated', 'aal2', S.recent);
+await expectOk('session active 8m50s after last activity', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
+await expectOk('touching an active session keeps it alive', `select public.touch_session()`);
+
+await as(A, 'authenticated', 'aal2', S.idle);
+await expectOk('idle session reads no files', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await expectOk('idle session reads no profile', `select count(*)::int n from public.profiles`, (r) => r.rows[0].n === 0);
+await expectOk('idle session gets empty stats', `select public.vault_stats() s`, (r) => r.rows[0].s.total_files === 0 && r.rows[0].s.quota_bytes === null);
+await expectOk('idle session cannot update files', `update public.files set display_name='idle' returning id`, (r) => r.rows.length === 0);
+await expectOk('idle session cannot delete files', `delete from public.files returning id`, (r) => r.rows.length === 0);
+await expectOk('idle session cannot update profile', `update public.profiles set full_name='idle' returning id`, (r) => r.rows.length === 0);
+await expectErr('idle session cannot insert files', `insert into public.files (original_name, display_name, storage_path, category, size_bytes) values ('i','i','${A}/pdfs/idle.pdf','pdf',1)`, /row-level security/);
+await expectOk('idle session sees no storage objects', `select count(*)::int n from storage.objects`, (r) => r.rows[0].n === 0);
+await expectErr('idle session cannot upload', `insert into storage.objects (bucket_id, name) values ('vault-files', '${A}/images/idle.jpg')`, /row-level security/);
+await expectOk('idle session cannot delete objects', `delete from storage.objects returning id`, (r) => r.rows.length === 0);
+await expectErr('touch_session does not revive an idle session', `select public.touch_session()`, /SESSION_EXPIRED/);
+await db.exec('reset role');
+await expectOk('idle session activity left untouched', `select (last_seen_at < now() - interval '9 minutes') stale from public.session_activity where session_id='${S.idle}'`, (r) => r.rows[0].stale === true);
+
+await as(A, 'authenticated', 'aal2', S.old);
+await expectOk('session older than 9 min with no activity is expired', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await expectErr('touch_session rejects it', `select public.touch_session()`, /SESSION_EXPIRED/);
+
+await as(A, 'authenticated', 'aal2', S.revoked);
+await expectOk('new session is active before its first touch', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
+await db.exec(`reset role; delete from auth.sessions where id='${S.revoked}'`);
+await as(A, 'authenticated', 'aal2', S.revoked);
+await expectOk('signed-out session reads nothing with a still-valid JWT', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await expectErr('touch_session reports signed-out session', `select public.touch_session()`, /SESSION_REVOKED/);
+await as(A, 'authenticated', 'aal2', null);
+await expectOk('JWT without session_id reads nothing', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await as(B, 'authenticated', 'aal2', S.recent);
+await expectOk("another user's session id is not accepted", `select count(*)::int n from public.profiles`, (r) => r.rows[0].n === 0);
+
+await as(B);
+await expectOk('other users are unaffected by A idle sessions', `select count(*)::int n from public.profiles`, (r) => r.rows[0].n === 1);
+await expectErr('session_activity is not directly readable', `select * from public.session_activity`, /permission denied/);
+await expectErr('session_activity is not directly writable', `update public.session_activity set last_seen_at = now()`, /permission denied/);
+await expectErr('session_state is not callable by clients', `select public.session_state()`, /permission denied/);
+await expectErr('clients cannot call the auth hook', `select public.idle_timeout_access_token_hook('{}'::jsonb)`, /permission denied/);
+await as(null, 'anon');
+await expectErr('anon cannot touch a session', `select public.touch_session()`, /permission denied/);
+
+await db.exec('reset role');
+const hook = (sid) => `select public.idle_timeout_access_token_hook('{"claims":{"sub":"${A}","session_id":"${sid}"}}'::jsonb) r`;
+await expectOk('hook refuses to refresh an idle session', hook(S.idle), (r) => r.rows[0].r.error?.http_code === 401);
+await expectOk('hook passes an active session through unchanged', hook(S.recent), (r) => r.rows[0].r.claims?.session_id === S.recent && !r.rows[0].r.error);
+await expectOk('hook allows a brand-new session', hook('a5e55100-0000-4000-8000-0000000000ff'), (r) => !r.rows[0].r.error);
+await expectOk('hook tolerates a missing session_id', `select public.idle_timeout_access_token_hook('{"claims":{}}'::jsonb) r`, (r) => !r.rows[0].r.error);
+await db.exec('set role supabase_auth_admin');
+await expectOk('supabase_auth_admin can run the hook', hook(S.recent), (r) => !r.rows[0].r.error);
+await db.exec('reset role');
+
 // ---- Upgrade path: a vault created with the first schema ----
 db = await freshDb();
 await db.exec(schemaV1);
 await db.exec(`insert into auth.users (id, email) values ('${A}','a@x.com')`);
+await addSessions(db);
 await db.exec(`update storage.buckets set file_size_limit = 1073741824 where id = 'vault-files'`);
 await as(A);
 await db.exec(

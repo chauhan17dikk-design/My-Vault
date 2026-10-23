@@ -30,6 +30,8 @@ export function getErrorMessage(error: unknown, fallback = 'Something went wrong
   if (status === 413 || msg.includes('payload too large') || msg.includes('exceeded the maximum allowed size'))
     return 'File is too large for your storage plan.';
   if (msg.includes('mime type') && msg.includes('not supported')) return 'This file type is not supported.';
+  if (msg.includes('session_expired') || msg.includes('session_revoked'))
+    return 'Your session has expired. Please sign in again.';
   if (status === 401 || msg.includes('jwt expired') || msg.includes('invalid jwt') || msg.includes('not authenticated'))
     return 'Your session has expired. Please sign in again.';
   if (status === 403 || msg.includes('row-level security') || msg.includes('unauthorized'))

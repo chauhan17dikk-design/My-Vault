@@ -1,8 +1,10 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
 import type { Session, User } from '@supabase/supabase-js';
-import { clearRecoverySession, markRecoverySession, sessionAal, setRememberSession, supabase } from '@/lib/supabase';
+import { clearRecoverySession, markRecoverySession, purgeLocalAuth, sessionAal, setRememberSession, supabase } from '@/lib/supabase';
 import { queryClient } from '@/lib/queryClient';
+import { broadcastEnded, isIdleExpired, sessionIdOf, setSessionNotice, writeActivity, type EndReason } from '@/lib/session';
+import { useIdleTimeout } from '@/hooks/useIdleTimeout';
 
 interface AuthContextValue {
   session: Session | null;
@@ -16,21 +18,73 @@ interface AuthContextValue {
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
+/** Give up waiting for the sign-out request after this long (e.g. offline). */
+const SIGN_OUT_TIMEOUT_MS = 5000;
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const navigate = useNavigate();
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  /** Session ids that have been ended here. They are never restored. */
+  const ended = useRef(new Set<string>());
+
+  /**
+   * End a session that timed out, was revoked, or ended in another tab:
+   * hide protected UI at once, then revoke it on the server and clear the
+   * stored tokens. AppLayout then redirects to /login.
+   */
+  const endSession = useCallback(
+    async (reason: EndReason, sid: string, fromOtherTab = false) => {
+      if (ended.current.has(sid)) return;
+      ended.current.add(sid);
+      if (reason !== 'signout') setSessionNotice(reason);
+      writeActivity(sid, 0); // marks this session as ended for every tab and reload
+      if (!fromOtherTab) broadcastEnded(sid, reason);
+      setSession(null);
+      setLoading(false);
+      queryClient.clear();
+      if (window.location.pathname === '/reset-password') navigate('/login', { replace: true });
+
+      // Revokes the refresh token server-side. Bounded so an offline device
+      // still drops its tokens.
+      const timeout = new Promise<{ error: Error }>((resolve) =>
+        setTimeout(() => resolve({ error: new Error('Sign-out timed out') }), SIGN_OUT_TIMEOUT_MS),
+      );
+      const result = await Promise.race([supabase.auth.signOut({ scope: 'local' }).catch((error: Error) => ({ error })), timeout]);
+      if (result.error) {
+        // Only drop stored tokens if they still belong to this session (not
+        // a new sign-in that happened in the meantime).
+        const { data } = await supabase.auth.getSession().catch(() => ({ data: { session: null } }));
+        if (!data.session || sessionIdOf(data.session) === sid) purgeLocalAuth();
+      }
+    },
+    [navigate],
+  );
 
   useEffect(() => {
     let mounted = true;
-    supabase.auth.getSession().then(({ data }) => {
-      if (!mounted) return;
-      setSession(data.session);
-      setLoading(false);
-    });
-    const { data: sub } = supabase.auth.onAuthStateChange((event, next) => {
+    /** Accept a session from storage or an auth event, unless it already
+     *  timed out (reload, or returning to the site after a long time). */
+    const accept = (next: Session | null) => {
+      if (next) {
+        const sid = sessionIdOf(next);
+        if (ended.current.has(sid)) return;
+        if (isIdleExpired(sid)) {
+          void endSession('idle', sid);
+          return;
+        }
+      }
       setSession(next);
       setLoading(false);
+    };
+    supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) return;
+      accept(data.session);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((event, next) => {
+      accept(next);
       if (event === 'SIGNED_OUT') {
         queryClient.clear();
         clearRecoverySession();
@@ -44,7 +98,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       mounted = false;
       sub.subscription.unsubscribe();
     };
-  }, [navigate]);
+  }, [navigate, endSession]);
+
+  const sid = useMemo(() => (session ? sessionIdOf(session) : null), [session]);
+  useIdleTimeout(sid, endSession);
 
   const signIn = useCallback(async (email: string, password: string, remember: boolean) => {
     setRememberSession(remember);
@@ -53,8 +110,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signOut = useCallback(async (scope: 'local' | 'global' = 'local') => {
+    const current = sessionRef.current;
     const { error } = await supabase.auth.signOut({ scope });
     queryClient.clear();
+    if (current) {
+      // Other tabs (including ones holding a per-tab session) sign out too.
+      const id = sessionIdOf(current);
+      writeActivity(id, 0);
+      broadcastEnded(id, 'signout');
+    }
     if (error) throw error;
   }, []);
 

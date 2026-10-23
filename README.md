@@ -51,6 +51,10 @@ bug in the UI can't leak another user's files.
 
 **`public.profiles`**: `full_name`, `avatar_path`, `preferences jsonb` (view, page size, theme — synced across devices), `storage_quota_bytes`.
 
+**`public.session_activity`**: `session_id` (the Supabase Auth session), `user_id`,
+`last_seen_at`. Used only by the session functions for the 9-minute inactivity
+timeout (section 4). Clients have no direct access to it.
+
 **Indexes**: partial B-tree indexes per access pattern (active by date, by
 category, favorites, recently opened, trash, size, name), a **trigram GIN index on
 `search_text`** for fast substring search ("voic" matches "Invoice.pdf"), and a
@@ -97,6 +101,59 @@ original name is kept in the database.
    new password for a genuine recovery-link session. Signed-in users change their
    password in Settings, which re-verifies the current password first.
 5. Settings also offers "sign out everywhere" (revokes all refresh tokens).
+6. **Automatic sign-out after 9 minutes of inactivity** (see below).
+
+### Inactivity timeout (9 minutes)
+
+Inactivity means no mouse movement, click, key press, scroll, wheel, touch or
+drag-and-drop in **any** open tab of the app.
+
+**In the browser** (`src/hooks/useIdleTimeout.ts`, `src/lib/session.ts`,
+wired up in `src/context/AuthContext.tsx`):
+- Each tab keeps one timer, set for exactly 9 minutes after the last activity.
+  The last activity time is shared between tabs in `localStorage`
+  (`vault.last-activity`, no credentials in it), so working in one tab keeps
+  the others signed in too.
+- When the time is up, the tab hides the protected UI immediately, clears the
+  query cache, calls `signOut({ scope: 'local' })` (which revokes the session's
+  refresh token on the server), and drops the stored tokens even if that request
+  fails or the device is offline. `AppLayout` then redirects to `/login`.
+- `/login` shows once: *"Your session has expired due to 9 minutes of
+  inactivity. Please log in again to continue."* Uploads that were still running
+  are stopped, and the notice says so. After signing in you return to the page
+  you were on.
+- Other tabs are told through a `storage` event and sign out too. Manual sign-out
+  is shared the same way.
+- Browsers delay timers in background tabs, so the deadline is also checked when
+  a tab becomes visible, gets focus, or is restored with Back/Forward. A reload
+  after the deadline goes straight to `/login`. Input that arrives after the
+  deadline never revives a session.
+
+**On the server** (`schema.sql`, section 1). The browser timer is not the
+security boundary:
+- While the user is active the app calls `touch_session()`, at most every 30
+  seconds and once right after sign-in or page load.
+- Every table and storage policy also requires `session_is_active()`. It is true
+  only if the session in the caller's JWT still exists in `auth.sessions` (it has
+  not been signed out) and has reported activity within the last 9 minutes. A
+  session that has never reported activity counts as active only in its first 9
+  minutes.
+- An idle or signed-out session can't read, list, sign, upload, change or delete
+  anything, even with an access token that has not expired yet.
+  `touch_session()` refuses to revive it (`SESSION_EXPIRED` /
+  `SESSION_REVOKED`), and the app then signs out with the notice above. This
+  also ends sessions that were revoked with "sign out everywhere" on another
+  device.
+- Optional: the `idle_timeout_access_token_hook` Auth hook (setup step 10) also
+  makes Supabase Auth refuse to *refresh* an idle session, so its refresh token
+  is useless even if the tab was closed before it could sign out.
+
+Because activity is reported every 30 seconds, the server's deadline is between
+9:00 and 9:30 after the last input. The browser always signs out first, at
+exactly 9:00. Signed preview and download URLs that were already issued stay
+valid until they expire (at most 1 hour; avatars 24 hours), as before. To change
+the timeout, edit `IDLE_TIMEOUT_MS` in `src/lib/session.ts` **and**
+`session_idle_limit()` in `schema.sql`.
 
 ## 5. Security model (RLS)
 
@@ -108,6 +165,8 @@ original name is kept in the database.
 | `storage.objects` | Bucket `vault-files` only. The first folder must equal `auth.uid()`. Uploads **and renames/overwrites** are only allowed into known subfolders. Executable extensions are blocked. Resumable (TUS) uploads go through the same policies. |
 | `anon` role | No table or function access at all |
 | `vault_stats()` | `security invoker`, runs under the caller's RLS |
+| All of the above | Also require `session_is_active()`: the JWT's session still exists and was active within the last 9 minutes |
+| `session_activity` | No client access. Written only through `touch_session()`, which never revives an expired session |
 
 The client never supplies the user ID used for authorization. It comes from the
 verified JWT (`auth.uid()`).
@@ -118,12 +177,14 @@ a path when the caller's `select` policy allows it, so another account or an
 anonymous visitor can't get a link to your files, even if they guess an
 object path.
 
-`npm run test:db` runs **68 security tests** against the real schema using PGlite
+`npm run test:db` runs **115 security tests** against the real schema using PGlite
 (Postgres compiled to WASM) with stand-ins for Supabase's `auth`/`storage`
 schemas. The tests cover cross-user reads, writes, overwrites and deletes, path
 spoofing, quota tampering, immutable columns, blocked file types, anonymous
-access, the Videos category, and **upgrading a vault created with the first
-schema** (`supabase/tests/fixtures/schema-v1.sql`) without losing rows or the
+access, the Videos category, the **9-minute inactivity timeout** (idle,
+signed-out and never-touched sessions are locked out of tables and storage and
+can't be revived; the Auth hook refuses idle refreshes), and **upgrading a vault
+created with the first schema** (`supabase/tests/fixtures/schema-v1.sql`) without losing rows or the
 bucket size limit.
 
 ---
@@ -148,7 +209,7 @@ bucket size limit.
    QR code: scan it with an authenticator app (Google Authenticator, Microsoft
    Authenticator, Authy) and enter the 6-digit code. Every later sign-in needs
    the password **and** a code from that phone. The database enforces this too
-   (section 4 of `schema.sql`): a password-only session can't read or change
+   (section 5 of `schema.sql`): a password-only session can't read or change
    anything. Sign in and set this up right after creating the account. Lost the
    phone? Delete the factor under *Authentication → Users → your user → MFA
    factors*, then sign in to scan a new QR code.
@@ -181,6 +242,13 @@ bucket size limit.
 9. Recommended hardening: set a minimum password length of at least 12
    (*Authentication → Policies*), and enable leaked-password protection
    (Pro plan).
+10. Recommended: **refuse to refresh idle sessions.** Go to *Authentication →
+    Hooks → Customize Access Token (JWT) Claims*, choose **Postgres**, and select
+    `public.idle_timeout_access_token_hook`. Without it the timeout is still
+    enforced on all data and files (section 4). The hook also makes a closed
+    tab's refresh token stop working after 9 idle minutes. New sign-ins are never
+    affected. If you already use a custom access token hook, merge the check
+    into it instead.
 
 ## Upgrading an existing vault
 
@@ -198,8 +266,18 @@ earlier version of this project (before Videos):
    - replaces `vault_stats()` (adds `videos`),
    - replaces the storage insert/update policies (allow `videos/`; renames can
      no longer produce a blocked extension or unknown folder),
-   - keeps the bucket private **without** resetting a size limit you raised.
+   - keeps the bucket private **without** resetting a size limit you raised,
+   - adds the 9-minute inactivity timeout: the `session_activity` table, the
+     session functions and the optional Auth hook, and adds
+     `session_is_active()` to every table and storage policy.
    Existing rows, objects, profiles and quotas are untouched.
+
+   **Deploy order for the inactivity timeout: deploy the new frontend first, then
+   run the schema.** The new frontend works against the old schema (it ignores a
+   missing `touch_session()`). An old frontend against the new schema would show
+   an empty vault, because it never reports activity. After the upgrade, existing
+   sessions older than 9 minutes have no activity record and are signed out
+   once. Sign in again.
 3. Deploy the new frontend **after** step 2. The new build reads
    `duration_seconds`, so running it against the old schema fails to list
    files.
@@ -276,10 +354,11 @@ src/
                           FileInfoPanel, fallbacks
     ui/                   Button, Input, Modal, Menu, ConfirmDialog, EmptyState, Skeleton…
   context/                Auth, Upload queue, File actions
-  hooks/                  useFiles (infinite query), useFileFilters (URL state), useProfile
-  services/               files, upload, profile (all Supabase calls)
+  hooks/                  useFiles (infinite query), useFileFilters (URL state), useProfile,
+                          useIdleTimeout (9-minute inactivity sign-out)
+  services/               files, upload, profile, session (all Supabase calls)
   lib/                    supabase client, categories registry, views, pdf, thumbnails,
-                          preview rules, errors, query cache
+                          preview rules, errors, query cache, session (timeout state shared by tabs)
   types/, utils/
 ```
 
@@ -343,7 +422,7 @@ needed, and the same RLS policies apply.
 ## 11. Review results and known limitations
 
 Verified: TypeScript strict build passes, the production build passes, and
-68/68 database security tests pass. The first release was also exercised in a
+115/115 database security tests pass. The first release was also exercised in a
 browser against a mock API (login, dashboard, galleries, lightbox, PDF viewer,
 search, list view, trash with undo, bulk selection, delete confirmation,
 upload pipeline, settings, dark mode, mobile drawer, and the production CSP with

@@ -69,6 +69,21 @@ const authStorage = {
   },
 };
 
+/**
+ * Drop the locally stored Supabase session (access + refresh token) without
+ * a network round-trip. Used when sign-out could not reach the server, e.g.
+ * offline at the moment an idle session expires.
+ */
+export function purgeLocalAuth() {
+  for (const store of safe((): Storage[] => [localStorage, sessionStorage], [])) {
+    safe(() => {
+      Object.keys(store)
+        .filter((k) => /^sb-.+-auth-token/.test(k))
+        .forEach((k) => store.removeItem(k));
+    }, undefined);
+  }
+}
+
 // Only the public anon key is used here. All access control is enforced by
 // Postgres RLS and Storage policies on the server.
 export const supabase = createClient(

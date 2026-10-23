@@ -13,7 +13,176 @@
 create extension if not exists pg_trgm with schema extensions;
 
 -- ---------------------------------------------------------------------
--- 1. Profiles (one row per auth user)
+-- 1. Sessions: automatic sign-out after 9 minutes of inactivity
+-- ---------------------------------------------------------------------
+-- The browser signs out after 9 minutes without input, but a timer in the
+-- page is not a security boundary. The server keeps its own record: while
+-- the user is active the app calls touch_session() (at most every 30 s), and
+-- every table and storage policy below also requires session_is_active().
+-- A session that has been idle for 9 minutes, or that was signed out (its
+-- auth.sessions row is gone), can no longer read or change anything, even
+-- with an access token that has not expired yet. Expired sessions are never
+-- revived; the user has to sign in again, which creates a new session.
+create table if not exists public.session_activity (
+  session_id   uuid primary key,
+  user_id      uuid not null references auth.users (id) on delete cascade,
+  last_seen_at timestamptz not null default now()
+);
+create index if not exists session_activity_user_idx on public.session_activity (user_id);
+
+-- No policies and no grants: only the security definer functions below
+-- read or write this table.
+alter table public.session_activity enable row level security;
+revoke all on public.session_activity from anon, authenticated;
+
+-- The idle limit. Keep in sync with IDLE_TIMEOUT_MS in src/lib/session.ts.
+create or replace function public.session_idle_limit()
+returns interval
+language sql
+immutable
+set search_path = ''
+as $$
+  select interval '9 minutes';
+$$;
+
+-- 'active', 'expired' (idle for too long) or 'revoked' (signed out, or no
+-- session in the JWT) for the session in the caller's verified JWT.
+create or replace function public.session_state()
+returns text
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  uid      uuid := auth.uid();
+  raw_sid  text := auth.jwt() ->> 'session_id';
+  sid      uuid;
+  started  timestamptz;
+  seen     timestamptz;
+  verified boolean := false;
+begin
+  if uid is null or raw_sid is null or raw_sid !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    return 'revoked';
+  end if;
+  sid := raw_sid::uuid;
+
+  -- Supabase Auth deletes the session row on sign-out (this device, another
+  -- device, or "sign out everywhere"). Skipped if auth.sessions is unreadable
+  -- so a platform permission change can't lock everyone out.
+  if to_regclass('auth.sessions') is not null and has_table_privilege('auth.sessions', 'select') then
+    select s.created_at into started from auth.sessions s where s.id = sid and s.user_id = uid;
+    if not found then
+      return 'revoked';
+    end if;
+    verified := true;
+  end if;
+
+  select a.last_seen_at into seen
+  from public.session_activity a
+  where a.session_id = sid and a.user_id = uid;
+  if found then
+    return case when seen > now() - public.session_idle_limit() then 'active' else 'expired' end;
+  end if;
+
+  -- No activity reported yet: only a session that signed in within the idle
+  -- limit counts (the app reports activity right after sign-in).
+  if verified and started <= now() - public.session_idle_limit() then
+    return 'expired';
+  end if;
+  return 'active';
+end;
+$$;
+
+create or replace function public.session_is_active()
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select public.session_state() = 'active';
+$$;
+
+-- Called by the app on sign-in, on page load and while the user is active.
+-- Raises SESSION_EXPIRED / SESSION_REVOKED instead of reviving a session.
+create or replace function public.touch_session()
+returns void
+language plpgsql
+volatile
+security definer
+set search_path = ''
+as $$
+declare
+  state text := public.session_state();
+begin
+  if state = 'revoked' then
+    raise exception 'SESSION_REVOKED' using hint = 'This session has been signed out. Sign in again.';
+  elsif state = 'expired' then
+    raise exception 'SESSION_EXPIRED' using hint = 'Signed out after 9 minutes of inactivity. Sign in again.';
+  end if;
+
+  insert into public.session_activity (session_id, user_id, last_seen_at)
+  values ((auth.jwt() ->> 'session_id')::uuid, auth.uid(), now())
+  on conflict (session_id) do update
+    set last_seen_at = excluded.last_seen_at
+    where public.session_activity.user_id = excluded.user_id;
+
+  -- Forget this user's long-idle sessions. Without a row, a session older
+  -- than the idle limit is still 'expired', so nothing is revived.
+  if to_regclass('auth.sessions') is not null and has_table_privilege('auth.sessions', 'select') then
+    delete from public.session_activity a
+    where a.user_id = auth.uid() and a.last_seen_at < now() - interval '7 days';
+  end if;
+end;
+$$;
+
+revoke all on function public.session_idle_limit() from public, anon, authenticated;
+revoke all on function public.session_state() from public, anon, authenticated;
+revoke all on function public.session_is_active() from public, anon;
+revoke all on function public.touch_session() from public, anon;
+grant execute on function public.session_is_active() to authenticated;
+grant execute on function public.touch_session() to authenticated;
+
+-- Optional (recommended): also refuse to *refresh* an idle session, so its
+-- refresh token is useless even if the tab was closed before it could sign
+-- out. Enable in Authentication -> Hooks -> Customize Access Token (JWT)
+-- Claims -> Postgres -> public.idle_timeout_access_token_hook. New sign-ins
+-- are never affected: a new session has no activity row yet.
+create or replace function public.idle_timeout_access_token_hook(event jsonb)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  raw_sid text := event -> 'claims' ->> 'session_id';
+begin
+  if raw_sid ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' and exists (
+    select 1 from public.session_activity a
+    where a.session_id = raw_sid::uuid
+      and a.last_seen_at <= now() - public.session_idle_limit()
+  ) then
+    return jsonb_build_object('error', jsonb_build_object(
+      'http_code', 401,
+      'message', 'Your session has expired due to 9 minutes of inactivity. Please log in again to continue.'));
+  end if;
+  return event;
+end;
+$$;
+
+revoke all on function public.idle_timeout_access_token_hook(jsonb) from public, anon, authenticated;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'supabase_auth_admin') then
+    grant execute on function public.idle_timeout_access_token_hook(jsonb) to supabase_auth_admin;
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- 2. Profiles (one row per auth user)
 -- ---------------------------------------------------------------------
 create table if not exists public.profiles (
   id                  uuid primary key references auth.users (id) on delete cascade,
@@ -33,14 +202,15 @@ alter table public.profiles enable row level security;
 drop policy if exists "profiles: select own" on public.profiles;
 create policy "profiles: select own" on public.profiles
   for select to authenticated
-  using (id = (select auth.uid()));
+  using (id = (select auth.uid()) and (select public.session_is_active()));
 
 drop policy if exists "profiles: update own" on public.profiles;
 create policy "profiles: update own" on public.profiles
   for update to authenticated
-  using (id = (select auth.uid()))
+  using (id = (select auth.uid()) and (select public.session_is_active()))
   with check (
     id = (select auth.uid())
+    and (select public.session_is_active())
     and (avatar_path is null or split_part(avatar_path, '/', 1) = (select auth.uid())::text)
   );
 
@@ -92,7 +262,7 @@ create trigger profiles_touch
   for each row execute function public.touch_updated_at();
 
 -- ---------------------------------------------------------------------
--- 2. Files (metadata for every stored object)
+-- 3. Files (metadata for every stored object)
 -- ---------------------------------------------------------------------
 create table if not exists public.files (
   id               uuid primary key default gen_random_uuid(),
@@ -168,13 +338,14 @@ alter table public.files enable row level security;
 drop policy if exists "files: select own" on public.files;
 create policy "files: select own" on public.files
   for select to authenticated
-  using (user_id = (select auth.uid()));
+  using (user_id = (select auth.uid()) and (select public.session_is_active()));
 
 drop policy if exists "files: insert own" on public.files;
 create policy "files: insert own" on public.files
   for insert to authenticated
   with check (
     user_id = (select auth.uid())
+    and (select public.session_is_active())
     and split_part(storage_path, '/', 1) = (select auth.uid())::text
     and (thumbnail_path is null or split_part(thumbnail_path, '/', 1) = (select auth.uid())::text)
   );
@@ -182,16 +353,17 @@ create policy "files: insert own" on public.files
 drop policy if exists "files: update own" on public.files;
 create policy "files: update own" on public.files
   for update to authenticated
-  using (user_id = (select auth.uid()))
+  using (user_id = (select auth.uid()) and (select public.session_is_active()))
   with check (
     user_id = (select auth.uid())
+    and (select public.session_is_active())
     and (thumbnail_path is null or split_part(thumbnail_path, '/', 1) = (select auth.uid())::text)
   );
 
 drop policy if exists "files: delete own" on public.files;
 create policy "files: delete own" on public.files
   for delete to authenticated
-  using (user_id = (select auth.uid()));
+  using (user_id = (select auth.uid()) and (select public.session_is_active()));
 
 revoke all on public.files from anon;
 grant select, insert, update, delete on public.files to authenticated;
@@ -318,7 +490,7 @@ revoke all on function public.vault_stats() from public, anon;
 grant execute on function public.vault_stats() to authenticated;
 
 -- ---------------------------------------------------------------------
--- 3. Storage: private bucket + per-user folder policies
+-- 4. Storage: private bucket + per-user folder policies
 -- ---------------------------------------------------------------------
 -- file_size_limit: 50 MB (Free plan maximum) when the bucket is first
 -- created. Raise it on paid plans (Storage -> vault-files -> Edit bucket) and
@@ -338,6 +510,7 @@ create policy "vault: select own objects" on storage.objects
   using (
     bucket_id = 'vault-files'
     and (storage.foldername(name))[1] = (select auth.uid())::text
+    and (select public.session_is_active())
   );
 
 drop policy if exists "vault: insert own objects" on storage.objects;
@@ -346,6 +519,7 @@ create policy "vault: insert own objects" on storage.objects
   with check (
     bucket_id = 'vault-files'
     and (storage.foldername(name))[1] = (select auth.uid())::text
+    and (select public.session_is_active())
     and (storage.foldername(name))[2] in ('images', 'screenshots', 'pdfs', 'documents', 'videos', 'other', 'thumbs', 'avatar')
     and lower(storage.extension(name)) not in ('exe', 'msi', 'bat', 'cmd', 'com', 'scr', 'ps1', 'vbs', 'jar', 'app', 'dll', 'sh')
   );
@@ -358,10 +532,12 @@ create policy "vault: update own objects" on storage.objects
   using (
     bucket_id = 'vault-files'
     and (storage.foldername(name))[1] = (select auth.uid())::text
+    and (select public.session_is_active())
   )
   with check (
     bucket_id = 'vault-files'
     and (storage.foldername(name))[1] = (select auth.uid())::text
+    and (select public.session_is_active())
     and (storage.foldername(name))[2] in ('images', 'screenshots', 'pdfs', 'documents', 'videos', 'other', 'thumbs', 'avatar')
     and lower(storage.extension(name)) not in ('exe', 'msi', 'bat', 'cmd', 'com', 'scr', 'ps1', 'vbs', 'jar', 'app', 'dll', 'sh')
   );
@@ -372,10 +548,11 @@ create policy "vault: delete own objects" on storage.objects
   using (
     bucket_id = 'vault-files'
     and (storage.foldername(name))[1] = (select auth.uid())::text
+    and (select public.session_is_active())
   );
 
 -- ---------------------------------------------------------------------
--- 4. Two-step verification is mandatory
+-- 5. Two-step verification is mandatory
 -- ---------------------------------------------------------------------
 -- A password alone only yields an aal1 session. These RESTRICTIVE policies
 -- are AND-ed with every policy above, so nothing in the vault can be read or
