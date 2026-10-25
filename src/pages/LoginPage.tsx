@@ -1,6 +1,6 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useState, type FormEvent } from 'react';
 import { Link } from 'react-router';
-import { AlertCircle, Clock, Eye, EyeOff, Lock, Mail } from 'lucide-react';
+import { AlertCircle, Eye, EyeOff, Lock, Mail } from 'lucide-react';
 import { AuthLayout } from '@/layouts/AuthLayout';
 import { Button } from '@/components/ui/Button';
 import { Field, Input } from '@/components/ui/Input';
@@ -8,7 +8,6 @@ import { useAuth } from '@/context/AuthContext';
 import { getRememberSession } from '@/lib/supabase';
 import { getErrorMessage } from '@/lib/errors';
 import { isConfigured } from '@/lib/env';
-import { REVOKED_MESSAGE, SESSION_EXPIRED_MESSAGE, takeSessionNotice, type SessionNotice } from '@/lib/session';
 
 export function LoginPage() {
   const { signIn } = useAuth();
@@ -18,15 +17,6 @@ export function LoginPage() {
   const [remember, setRemember] = useState(getRememberSession);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<SessionNotice | null>(null);
-
-  // Why the last session ended (5-minute limit, revoked). Read once, then cleared,
-  // so it does not reappear on reload. Read in an effect: uploads that were
-  // stopped are recorded while the protected area unmounts.
-  useEffect(() => {
-    const pending = takeSessionNotice();
-    if (pending) setNotice(pending);
-  }, []);
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -55,16 +45,6 @@ export function LoginPage() {
       {!isConfigured && (
         <div className="mb-5 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
           Supabase is not configured. Copy <code>.env.example</code> to <code>.env.local</code> and add your project URL and anon key.
-        </div>
-      )}
-
-      {notice && !error && (
-        <div role="status" className="mb-5 flex items-start gap-2.5 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
-          <Clock className="mt-0.5 size-4 shrink-0" />
-          <div>
-            <p>{notice.reason === 'timeout' ? SESSION_EXPIRED_MESSAGE : REVOKED_MESSAGE}</p>
-            {notice.uploadsInterrupted && <p className="mt-1">Uploads that were still in progress were stopped. Add those files again after signing in.</p>}
-          </div>
         </div>
       )}
 

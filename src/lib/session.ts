@@ -4,18 +4,12 @@ import type { Session } from '@supabase/supabase-js';
  *  Keep in sync with public.session_max_age() in supabase/schema.sql. */
 export const SESSION_MAX_AGE_MS = 5 * 60 * 1000;
 
-export const SESSION_EXPIRED_MESSAGE =
-  'Your session has expired. For your security you are signed out 5 minutes after signing in. Please log in again to continue.';
-export const REVOKED_MESSAGE = 'Your session has ended. Please log in again to continue.';
-
 /** Why a session ended without the user signing out in this tab. */
 export type EndReason = 'timeout' | 'revoked' | 'signout';
 
 // Shared by every tab of the app (localStorage). Neither holds a credential.
 const START_KEY = 'vault.session-start';
 export const ENDED_KEY = 'vault.session-ended';
-// Per tab (sessionStorage): the notice the login page shows once.
-const NOTICE_KEY = 'vault.session-notice';
 
 function safe<T>(fn: () => T, fallback: T): T {
   try {
@@ -80,29 +74,3 @@ export function readEnded(sid: string): EndReason | null {
   return ended && ended.sid === sid ? ended.reason : null;
 }
 
-export interface SessionNotice {
-  reason: 'timeout' | 'revoked';
-  uploadsInterrupted?: boolean;
-}
-
-export function setSessionNotice(reason: SessionNotice['reason']) {
-  safe(() => sessionStorage.setItem(NOTICE_KEY, JSON.stringify({ reason } satisfies SessionNotice)), undefined);
-}
-
-/** Called when uploads are stopped because the session ended. */
-export function markUploadsInterrupted() {
-  safe(() => {
-    const notice = JSON.parse(sessionStorage.getItem(NOTICE_KEY) ?? 'null') as SessionNotice | null;
-    if (notice) sessionStorage.setItem(NOTICE_KEY, JSON.stringify({ ...notice, uploadsInterrupted: true }));
-  }, undefined);
-}
-
-/** Read and clear the pending notice, so it is shown exactly once. */
-export function takeSessionNotice(): SessionNotice | null {
-  return safe(() => {
-    const raw = sessionStorage.getItem(NOTICE_KEY);
-    sessionStorage.removeItem(NOTICE_KEY);
-    const notice = JSON.parse(raw ?? 'null') as SessionNotice | null;
-    return notice && (notice.reason === 'timeout' || notice.reason === 'revoked') ? notice : null;
-  }, null);
-}

@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router';
 import type { Session, User } from '@supabase/supabase-js';
 import { clearRecoverySession, markRecoverySession, purgeLocalAuth, sessionAal, setRememberSession, supabase } from '@/lib/supabase';
 import { queryClient } from '@/lib/queryClient';
-import { broadcastEnded, isSessionExpired, sessionIdOf, setSessionNotice, writeSessionStart, type EndReason } from '@/lib/session';
+import { broadcastEnded, isSessionExpired, sessionIdOf, writeSessionStart, type EndReason } from '@/lib/session';
 import { useSessionTimeout } from '@/hooks/useSessionTimeout';
 
 interface AuthContextValue {
@@ -39,7 +39,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     async (reason: EndReason, sid: string, fromOtherTab = false) => {
       if (ended.current.has(sid)) return;
       ended.current.add(sid);
-      if (reason !== 'signout') setSessionNotice(reason);
       writeSessionStart(sid, 0); // marks this session as ended for every tab and reload
       if (!fromOtherTab) broadcastEnded(sid, reason);
       setSession(null);

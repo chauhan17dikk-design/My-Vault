@@ -3,7 +3,6 @@ import { toast } from 'sonner';
 import { useUser } from './AuthContext';
 import { detectCategory } from '@/lib/categories';
 import { getErrorMessage } from '@/lib/errors';
-import { markUploadsInterrupted } from '@/lib/session';
 import { invalidateLibrary, qk, queryClient } from '@/lib/queryClient';
 import { RESUMABLE_THRESHOLD, uploadVaultFile, validateFile } from '@/services/upload';
 import type { Category, UploadItem, VaultStats } from '@/types';
@@ -111,7 +110,6 @@ export function UploadProvider({ children }: { children: ReactNode }) {
     const running = controllers.current;
     return () => {
       if (!running.size) return;
-      markUploadsInterrupted();
       running.forEach((c) => c.abort());
     };
   }, []);

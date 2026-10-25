@@ -119,10 +119,10 @@ wired up in `src/context/AuthContext.tsx`):
   query cache, calls `signOut({ scope: 'local' })` (which revokes the session's
   refresh token on the server), and drops the stored tokens even if that request
   fails or the device is offline. `AppLayout` then redirects to `/login`.
-- `/login` shows once: *"Your session has expired. For your security you are
-  signed out 5 minutes after signing in. Please log in again to continue."*
-  Uploads that were still running are stopped, and the notice says so. After
-  signing in you return to the page you were on.
+- The login page opens without any message. Uploads that were still running
+  are stopped. After signing in you return to the page you were on.
+- "Keep me signed in" doesn't change the limit. It only decides whether a
+  session that is still inside its 5 minutes survives closing the browser.
 - Other tabs are told through a `storage` event and sign out too. Manual sign-out
   is shared the same way.
 - Browsers delay timers in background tabs, so the deadline is also checked when
@@ -139,7 +139,7 @@ security boundary:
   delete anything, even with an access token that has not expired yet.
 - The app calls `touch_session()` on sign-in, page load and when a tab is
   reopened. It never adds time: it only reports `SESSION_EXPIRED` /
-  `SESSION_REVOKED`, and the app then signs out with the notice above. This also
+  `SESSION_REVOKED`, and the app then signs out as above. This also
   ends sessions that were revoked with "sign out everywhere" on another device.
 - Optional: the `idle_timeout_access_token_hook` Auth hook (setup step 10) makes
   Supabase Auth refuse to issue or refresh a token for a session older than 5
