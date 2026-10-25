@@ -3,8 +3,8 @@ import { useNavigate } from 'react-router';
 import type { Session, User } from '@supabase/supabase-js';
 import { clearRecoverySession, markRecoverySession, purgeLocalAuth, sessionAal, setRememberSession, supabase } from '@/lib/supabase';
 import { queryClient } from '@/lib/queryClient';
-import { broadcastEnded, isIdleExpired, sessionIdOf, setSessionNotice, writeActivity, type EndReason } from '@/lib/session';
-import { useIdleTimeout } from '@/hooks/useIdleTimeout';
+import { broadcastEnded, isSessionExpired, sessionIdOf, setSessionNotice, writeSessionStart, type EndReason } from '@/lib/session';
+import { useSessionTimeout } from '@/hooks/useSessionTimeout';
 
 interface AuthContextValue {
   session: Session | null;
@@ -40,7 +40,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (ended.current.has(sid)) return;
       ended.current.add(sid);
       if (reason !== 'signout') setSessionNotice(reason);
-      writeActivity(sid, 0); // marks this session as ended for every tab and reload
+      writeSessionStart(sid, 0); // marks this session as ended for every tab and reload
       if (!fromOtherTab) broadcastEnded(sid, reason);
       setSession(null);
       setLoading(false);
@@ -71,8 +71,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (next) {
         const sid = sessionIdOf(next);
         if (ended.current.has(sid)) return;
-        if (isIdleExpired(sid)) {
-          void endSession('idle', sid);
+        if (isSessionExpired(sid)) {
+          void endSession('timeout', sid);
           return;
         }
       }
@@ -101,7 +101,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [navigate, endSession]);
 
   const sid = useMemo(() => (session ? sessionIdOf(session) : null), [session]);
-  useIdleTimeout(sid, endSession);
+  useSessionTimeout(sid, endSession);
 
   const signIn = useCallback(async (email: string, password: string, remember: boolean) => {
     setRememberSession(remember);
@@ -116,7 +116,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (current) {
       // Other tabs (including ones holding a per-tab session) sign out too.
       const id = sessionIdOf(current);
-      writeActivity(id, 0);
+      writeSessionStart(id, 0);
       broadcastEnded(id, 'signout');
     }
     if (error) throw error;

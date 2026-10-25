@@ -6,6 +6,7 @@ import fs from 'node:fs';
 
 const schema = fs.readFileSync(process.argv[2] ?? new URL('../schema.sql', import.meta.url), 'utf8');
 const schemaV1 = fs.readFileSync(new URL('./fixtures/schema-v1.sql', import.meta.url), 'utf8');
+const schemaV3Idle = fs.readFileSync(new URL('./fixtures/schema-v3-idle.sql', import.meta.url), 'utf8');
 
 // ---- Minimal Supabase platform stubs (mirrors Supabase's definitions) ----
 const PLATFORM = `
@@ -204,50 +205,48 @@ await expectOk(
   (r) => r.rows[0].public === false && Number(r.rows[0].file_size_limit) === 5368709120,
 );
 
-// ---- Idle session timeout (9 minutes) ----
+// ---- Session limit: 5 minutes after sign-in, activity does not extend it ----
 // Separate sessions per scenario so A's main session stays active.
 const S = {
-  idle: 'a5e55100-0000-4000-8000-0000000000a1',
-  recent: 'a5e55100-0000-4000-8000-0000000000a2',
+  fresh: 'a5e55100-0000-4000-8000-0000000000a1',
+  almost: 'a5e55100-0000-4000-8000-0000000000a2',
   old: 'a5e55100-0000-4000-8000-0000000000a3',
   revoked: 'a5e55100-0000-4000-8000-0000000000a4',
 };
 await db.exec('reset role');
 await db.exec(`insert into auth.sessions (id, user_id, created_at) values
-  ('${S.idle}','${A}', now() - interval '1 hour'), ('${S.recent}','${A}', now() - interval '1 hour'),
-  ('${S.old}','${A}', now() - interval '10 minutes'), ('${S.revoked}','${A}', now())`);
-await db.exec(`insert into public.session_activity (session_id, user_id, last_seen_at) values ('${S.idle}','${A}', now() - interval '1 minute')`);
+  ('${S.fresh}','${A}', now()), ('${S.almost}','${A}', now() - interval '4 minutes 50 seconds'),
+  ('${S.old}','${A}', now() - interval '5 minutes 1 second'), ('${S.revoked}','${A}', now())`);
 
-await as(A, 'authenticated', 'aal2', S.idle);
-await expectOk('recently active session can read', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
-await expectOk('touch_session records activity', `select public.touch_session()`);
+await as(A, 'authenticated', 'aal2', S.fresh);
+await expectOk('session just signed in can read', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
+await expectOk('touch_session accepts it', `select public.touch_session()`);
+await expectOk('touch_session twice is fine', `select public.touch_session()`);
 await db.exec('reset role');
-await expectOk('activity row updated for the JWT session', `select (last_seen_at > now() - interval '5 seconds') fresh from public.session_activity where session_id='${S.idle}'`, (r) => r.rows[0]?.fresh === true);
-await db.exec(`update public.session_activity set last_seen_at = now() - interval '9 minutes 1 second' where session_id='${S.idle}'`);
-await db.exec(`insert into public.session_activity (session_id, user_id, last_seen_at) values ('${S.recent}','${A}', now() - interval '8 minutes 50 seconds')`);
+await expectOk('first-seen time recorded once', `select count(*)::int n from public.session_activity where session_id='${S.fresh}'`, (r) => r.rows[0].n === 1);
 
-await as(A, 'authenticated', 'aal2', S.recent);
-await expectOk('session active 8m50s after last activity', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
-await expectOk('touching an active session keeps it alive', `select public.touch_session()`);
-
-await as(A, 'authenticated', 'aal2', S.idle);
-await expectOk('idle session reads no files', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
-await expectOk('idle session reads no profile', `select count(*)::int n from public.profiles`, (r) => r.rows[0].n === 0);
-await expectOk('idle session gets empty stats', `select public.vault_stats() s`, (r) => r.rows[0].s.total_files === 0 && r.rows[0].s.quota_bytes === null);
-await expectOk('idle session cannot update files', `update public.files set display_name='idle' returning id`, (r) => r.rows.length === 0);
-await expectOk('idle session cannot delete files', `delete from public.files returning id`, (r) => r.rows.length === 0);
-await expectOk('idle session cannot update profile', `update public.profiles set full_name='idle' returning id`, (r) => r.rows.length === 0);
-await expectErr('idle session cannot insert files', `insert into public.files (original_name, display_name, storage_path, category, size_bytes) values ('i','i','${A}/pdfs/idle.pdf','pdf',1)`, /row-level security/);
-await expectOk('idle session sees no storage objects', `select count(*)::int n from storage.objects`, (r) => r.rows[0].n === 0);
-await expectErr('idle session cannot upload', `insert into storage.objects (bucket_id, name) values ('vault-files', '${A}/images/idle.jpg')`, /row-level security/);
-await expectOk('idle session cannot delete objects', `delete from storage.objects returning id`, (r) => r.rows.length === 0);
-await expectErr('touch_session does not revive an idle session', `select public.touch_session()`, /SESSION_EXPIRED/);
-await db.exec('reset role');
-await expectOk('idle session activity left untouched', `select (last_seen_at < now() - interval '9 minutes') stale from public.session_activity where session_id='${S.idle}'`, (r) => r.rows[0].stale === true);
+await as(A, 'authenticated', 'aal2', S.almost);
+await expectOk('session 4m50s after sign-in is still active', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
+await expectOk('touching it adds no time', `select public.touch_session()`);
+await db.exec(`reset role; update auth.sessions set created_at = now() - interval '5 minutes 1 second' where id='${S.almost}'`);
+await as(A, 'authenticated', 'aal2', S.almost);
+await expectOk('recent activity does not keep a 5-minute-old session alive', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await expectErr('touch_session refuses to extend it', `select public.touch_session()`, /SESSION_EXPIRED/);
 
 await as(A, 'authenticated', 'aal2', S.old);
-await expectOk('session older than 9 min with no activity is expired', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
-await expectErr('touch_session rejects it', `select public.touch_session()`, /SESSION_EXPIRED/);
+await expectOk('expired session reads no files', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await expectOk('expired session reads no profile', `select count(*)::int n from public.profiles`, (r) => r.rows[0].n === 0);
+await expectOk('expired session gets empty stats', `select public.vault_stats() s`, (r) => r.rows[0].s.total_files === 0 && r.rows[0].s.quota_bytes === null);
+await expectOk('expired session cannot update files', `update public.files set display_name='old' returning id`, (r) => r.rows.length === 0);
+await expectOk('expired session cannot delete files', `delete from public.files returning id`, (r) => r.rows.length === 0);
+await expectOk('expired session cannot update profile', `update public.profiles set full_name='old' returning id`, (r) => r.rows.length === 0);
+await expectErr('expired session cannot insert files', `insert into public.files (original_name, display_name, storage_path, category, size_bytes) values ('i','i','${A}/pdfs/old.pdf','pdf',1)`, /row-level security/);
+await expectOk('expired session sees no storage objects', `select count(*)::int n from storage.objects`, (r) => r.rows[0].n === 0);
+await expectErr('expired session cannot upload', `insert into storage.objects (bucket_id, name) values ('vault-files', '${A}/images/old.jpg')`, /row-level security/);
+await expectOk('expired session cannot delete objects', `delete from storage.objects returning id`, (r) => r.rows.length === 0);
+await expectErr('touch_session reports the expiry', `select public.touch_session()`, /SESSION_EXPIRED/);
+await db.exec('reset role');
+await expectOk('expired session is not recorded', `select count(*)::int n from public.session_activity where session_id='${S.old}'`, (r) => r.rows[0].n === 0);
 
 await as(A, 'authenticated', 'aal2', S.revoked);
 await expectOk('new session is active before its first touch', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
@@ -257,13 +256,13 @@ await expectOk('signed-out session reads nothing with a still-valid JWT', `selec
 await expectErr('touch_session reports signed-out session', `select public.touch_session()`, /SESSION_REVOKED/);
 await as(A, 'authenticated', 'aal2', null);
 await expectOk('JWT without session_id reads nothing', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
-await as(B, 'authenticated', 'aal2', S.recent);
+await as(B, 'authenticated', 'aal2', S.fresh);
 await expectOk("another user's session id is not accepted", `select count(*)::int n from public.profiles`, (r) => r.rows[0].n === 0);
 
 await as(B);
-await expectOk('other users are unaffected by A idle sessions', `select count(*)::int n from public.profiles`, (r) => r.rows[0].n === 1);
+await expectOk('other users are unaffected by A expired sessions', `select count(*)::int n from public.profiles`, (r) => r.rows[0].n === 1);
 await expectErr('session_activity is not directly readable', `select * from public.session_activity`, /permission denied/);
-await expectErr('session_activity is not directly writable', `update public.session_activity set last_seen_at = now()`, /permission denied/);
+await expectErr('session_activity is not directly writable', `update public.session_activity set started_at = now()`, /permission denied/);
 await expectErr('session_state is not callable by clients', `select public.session_state()`, /permission denied/);
 await expectErr('clients cannot call the auth hook', `select public.idle_timeout_access_token_hook('{}'::jsonb)`, /permission denied/);
 await as(null, 'anon');
@@ -271,13 +270,14 @@ await expectErr('anon cannot touch a session', `select public.touch_session()`, 
 
 await db.exec('reset role');
 const hook = (sid) => `select public.idle_timeout_access_token_hook('{"claims":{"sub":"${A}","session_id":"${sid}"}}'::jsonb) r`;
-await expectOk('hook refuses to refresh an idle session', hook(S.idle), (r) => r.rows[0].r.error?.http_code === 401);
-await expectOk('hook passes an active session through unchanged', hook(S.recent), (r) => r.rows[0].r.claims?.session_id === S.recent && !r.rows[0].r.error);
+await expectOk('hook refuses a token for a session older than 5 minutes', hook(S.old), (r) => r.rows[0].r.error?.http_code === 401);
+await expectOk('hook passes a fresh session through unchanged', hook(S.fresh), (r) => r.rows[0].r.claims?.session_id === S.fresh && !r.rows[0].r.error);
 await expectOk('hook allows a brand-new session', hook('a5e55100-0000-4000-8000-0000000000ff'), (r) => !r.rows[0].r.error);
 await expectOk('hook tolerates a missing session_id', `select public.idle_timeout_access_token_hook('{"claims":{}}'::jsonb) r`, (r) => !r.rows[0].r.error);
 await db.exec('set role supabase_auth_admin');
-await expectOk('supabase_auth_admin can run the hook', hook(S.recent), (r) => !r.rows[0].r.error);
+await expectOk('supabase_auth_admin can run the hook', hook(S.fresh), (r) => !r.rows[0].r.error);
 await db.exec('reset role');
+await expectOk('old session_idle_limit() removed', `select to_regprocedure('public.session_idle_limit()') is null gone`, (r) => r.rows[0].gone === true);
 
 // ---- Upgrade path: a vault created with the first schema ----
 db = await freshDb();
@@ -310,6 +310,33 @@ await expectOk('upgraded storage policy accepts videos/', `insert into storage.o
 await expectOk('upgraded vault_stats reports videos', `select public.vault_stats() s`, (r) => r.rows[0].s.videos === 1 && r.rows[0].s.pdfs === 1);
 await as(B);
 await expectOk('upgraded vault still isolates users', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+
+// ---- Upgrade path: the 9-minute inactivity version (what is live today) ----
+db = await freshDb();
+await db.exec(schemaV3Idle);
+await db.exec(`insert into auth.users (id, email) values ('${A}','a@x.com'), ('${B}','b@x.com')`);
+await addSessions(db);
+const OLD_SID = 'a5e55100-0000-4000-8000-0000000000b1';
+await db.exec(`insert into auth.sessions (id, user_id, created_at) values ('${OLD_SID}','${A}', now() - interval '20 minutes')`);
+await as(A);
+await db.exec(`insert into public.files (id, original_name, display_name, storage_path, extension, category, size_bytes) values ('aaaaaaaa-0000-0000-0000-0000000000c1', 'keep.pdf', 'keep', '${A}/pdfs/keep.pdf', 'pdf', 'pdf', 10)`);
+await db.exec(`reset role; insert into public.session_activity (session_id, user_id, last_seen_at) values ('${OLD_SID}','${A}', now())`);
+await as(A, 'authenticated', 'aal2', OLD_SID);
+await expectOk('9-minute version: an active 20-minute-old session can read (sanity check)', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 1);
+await db.exec('reset role');
+await db.exec(schema);
+await db.exec(schema);
+await expectOk('upgrade renames last_seen_at to started_at and keeps rows', `select count(*)::int n from public.session_activity where session_id='${OLD_SID}' and started_at is not null`, (r) => r.rows[0].n === 1);
+await expectOk('upgrade keeps files', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 1);
+await as(A, 'authenticated', 'aal2', OLD_SID);
+await expectOk('after upgrade a session older than 5 minutes is cut off despite recent activity', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await as(A);
+await expectOk('after upgrade a fresh session works', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 1);
+await expectOk('after upgrade touch_session works', `select public.touch_session()`);
+await as(A, 'authenticated', 'aal1');
+await expectOk('after upgrade two-step verification is still required', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await as(B);
+await expectOk('after upgrade users stay isolated', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

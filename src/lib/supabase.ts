@@ -72,7 +72,7 @@ const authStorage = {
 /**
  * Drop the locally stored Supabase session (access + refresh token) without
  * a network round-trip. Used when sign-out could not reach the server, e.g.
- * offline at the moment an idle session expires.
+ * offline at the moment a session expires.
  */
 export function purgeLocalAuth() {
   for (const store of safe((): Storage[] => [localStorage, sessionStorage], [])) {

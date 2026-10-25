@@ -1,17 +1,18 @@
 import type { Session } from '@supabase/supabase-js';
 
-/** Sign out after this long without user input. Keep in sync with
- *  public.session_idle_limit() in supabase/schema.sql. */
-export const IDLE_TIMEOUT_MS = 9 * 60 * 1000;
+/** Every session ends this long after sign-in, whatever the user is doing.
+ *  Keep in sync with public.session_max_age() in supabase/schema.sql. */
+export const SESSION_MAX_AGE_MS = 5 * 60 * 1000;
 
-export const IDLE_EXPIRED_MESSAGE = 'Your session has expired due to 9 minutes of inactivity. Please log in again to continue.';
+export const SESSION_EXPIRED_MESSAGE =
+  'Your session has expired. For your security you are signed out 5 minutes after signing in. Please log in again to continue.';
 export const REVOKED_MESSAGE = 'Your session has ended. Please log in again to continue.';
 
 /** Why a session ended without the user signing out in this tab. */
-export type EndReason = 'idle' | 'revoked' | 'signout';
+export type EndReason = 'timeout' | 'revoked' | 'signout';
 
 // Shared by every tab of the app (localStorage). Neither holds a credential.
-const ACTIVITY_KEY = 'vault.last-activity';
+const START_KEY = 'vault.session-start';
 export const ENDED_KEY = 'vault.session-ended';
 // Per tab (sessionStorage): the notice the login page shows once.
 const NOTICE_KEY = 'vault.session-notice';
@@ -34,33 +35,29 @@ export function sessionIdOf(session: Session): string {
   }, session.user.id);
 }
 
-interface ActivityRecord {
+interface StartRecord {
   sid: string;
   at: number;
 }
 
-/** Last user activity for this session in any tab, or null if unknown. */
-export function readActivity(sid: string): number | null {
+/** When this session signed in (local clock, shared by all tabs), or null
+ *  if unknown. 0 means the session was ended. */
+export function readSessionStart(sid: string): number | null {
   return safe(() => {
-    const rec = JSON.parse(localStorage.getItem(ACTIVITY_KEY) ?? 'null') as ActivityRecord | null;
+    const rec = JSON.parse(localStorage.getItem(START_KEY) ?? 'null') as StartRecord | null;
     return rec && rec.sid === sid && typeof rec.at === 'number' ? rec.at : null;
   }, null);
 }
 
-export function writeActivity(sid: string, at: number) {
-  safe(() => {
-    // Never move another tab's newer timestamp backwards.
-    const prev = readActivity(sid);
-    if (prev !== null && prev >= at && at !== 0) return;
-    localStorage.setItem(ACTIVITY_KEY, JSON.stringify({ sid, at } satisfies ActivityRecord));
-  }, undefined);
+export function writeSessionStart(sid: string, at: number) {
+  safe(() => localStorage.setItem(START_KEY, JSON.stringify({ sid, at } satisfies StartRecord)), undefined);
 }
 
-/** True when this session is known to have been idle past the limit (or was
- *  ended), e.g. on a reload or when returning to a long-hidden tab. */
-export function isIdleExpired(sid: string, now = Date.now()): boolean {
-  const at = readActivity(sid);
-  return at !== null && now - at >= IDLE_TIMEOUT_MS;
+/** True when this session is known to be past its 5 minutes (or was ended),
+ *  e.g. on a reload or when returning to a hidden tab. */
+export function isSessionExpired(sid: string, now = Date.now()): boolean {
+  const at = readSessionStart(sid);
+  return at !== null && now - at >= SESSION_MAX_AGE_MS;
 }
 
 /** Tell other tabs this session is over (they receive a `storage` event). */
@@ -72,7 +69,7 @@ export function parseEnded(value: string | null): { sid: string; reason: EndReas
   return safe(() => {
     const v = JSON.parse(value ?? 'null') as { sid?: unknown; reason?: unknown } | null;
     if (!v || typeof v.sid !== 'string') return null;
-    const reason: EndReason = v.reason === 'idle' || v.reason === 'revoked' ? v.reason : 'signout';
+    const reason: EndReason = v.reason === 'timeout' || v.reason === 'revoked' ? v.reason : 'signout';
     return { sid: v.sid, reason };
   }, null);
 }
@@ -84,7 +81,7 @@ export function readEnded(sid: string): EndReason | null {
 }
 
 export interface SessionNotice {
-  reason: 'idle' | 'revoked';
+  reason: 'timeout' | 'revoked';
   uploadsInterrupted?: boolean;
 }
 
@@ -106,6 +103,6 @@ export function takeSessionNotice(): SessionNotice | null {
     const raw = sessionStorage.getItem(NOTICE_KEY);
     sessionStorage.removeItem(NOTICE_KEY);
     const notice = JSON.parse(raw ?? 'null') as SessionNotice | null;
-    return notice && (notice.reason === 'idle' || notice.reason === 'revoked') ? notice : null;
+    return notice && (notice.reason === 'timeout' || notice.reason === 'revoked') ? notice : null;
   }, null);
 }

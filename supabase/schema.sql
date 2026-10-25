@@ -13,21 +13,31 @@
 create extension if not exists pg_trgm with schema extensions;
 
 -- ---------------------------------------------------------------------
--- 1. Sessions: automatic sign-out after 9 minutes of inactivity
+-- 1. Sessions: automatic sign-out 5 minutes after sign-in
 -- ---------------------------------------------------------------------
--- The browser signs out after 9 minutes without input, but a timer in the
--- page is not a security boundary. The server keeps its own record: while
--- the user is active the app calls touch_session() (at most every 30 s), and
--- every table and storage policy below also requires session_is_active().
--- A session that has been idle for 9 minutes, or that was signed out (its
--- auth.sessions row is gone), can no longer read or change anything, even
--- with an access token that has not expired yet. Expired sessions are never
--- revived; the user has to sign in again, which creates a new session.
+-- Every session ends 5 minutes after the password sign-in, whatever the
+-- user is doing: activity does not extend it. The browser signs out at that
+-- moment, but a timer in the page is not a security boundary, so every
+-- table and storage policy below also requires session_is_active(), which
+-- counts from the session's own sign-in time in auth.sessions. A session
+-- older than 5 minutes, or one that was signed out (its auth.sessions row is
+-- gone), can no longer read or change anything, even with an access token
+-- that has not expired yet. The user has to sign in again.
 create table if not exists public.session_activity (
-  session_id   uuid primary key,
-  user_id      uuid not null references auth.users (id) on delete cascade,
-  last_seen_at timestamptz not null default now()
+  session_id uuid primary key,
+  user_id    uuid not null references auth.users (id) on delete cascade,
+  started_at timestamptz not null default now()
 );
+-- Upgrade from the 9-minute inactivity version, where this column held the
+-- last activity. It now holds when the app first saw the session.
+do $$
+begin
+  if exists (select 1 from information_schema.columns
+             where table_schema = 'public' and table_name = 'session_activity' and column_name = 'last_seen_at') then
+    alter table public.session_activity rename column last_seen_at to started_at;
+  end if;
+end;
+$$;
 create index if not exists session_activity_user_idx on public.session_activity (user_id);
 
 -- No policies and no grants: only the security definer functions below
@@ -35,18 +45,21 @@ create index if not exists session_activity_user_idx on public.session_activity 
 alter table public.session_activity enable row level security;
 revoke all on public.session_activity from anon, authenticated;
 
--- The idle limit. Keep in sync with IDLE_TIMEOUT_MS in src/lib/session.ts.
-create or replace function public.session_idle_limit()
+-- The session limit. Keep in sync with SESSION_MAX_AGE_MS in src/lib/session.ts.
+create or replace function public.session_max_age()
 returns interval
 language sql
 immutable
 set search_path = ''
 as $$
-  select interval '9 minutes';
+  select interval '5 minutes';
 $$;
 
--- 'active', 'expired' (idle for too long) or 'revoked' (signed out, or no
--- session in the JWT) for the session in the caller's verified JWT.
+-- When the session in the caller's verified JWT signed in. Normally read
+-- from auth.sessions (Supabase Auth's own record, which also proves the
+-- session has not been signed out). If auth.sessions is unreadable, falls
+-- back to when the app first reported the session, so a platform permission
+-- change can't lock everyone out.
 create or replace function public.session_state()
 returns text
 language plpgsql
@@ -55,42 +68,31 @@ security definer
 set search_path = ''
 as $$
 declare
-  uid      uuid := auth.uid();
-  raw_sid  text := auth.jwt() ->> 'session_id';
-  sid      uuid;
-  started  timestamptz;
-  seen     timestamptz;
-  verified boolean := false;
+  uid     uuid := auth.uid();
+  raw_sid text := auth.jwt() ->> 'session_id';
+  sid     uuid;
+  started timestamptz;
 begin
   if uid is null or raw_sid is null or raw_sid !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
     return 'revoked';
   end if;
   sid := raw_sid::uuid;
 
-  -- Supabase Auth deletes the session row on sign-out (this device, another
-  -- device, or "sign out everywhere"). Skipped if auth.sessions is unreadable
-  -- so a platform permission change can't lock everyone out.
   if to_regclass('auth.sessions') is not null and has_table_privilege('auth.sessions', 'select') then
+    -- Supabase Auth deletes the row on sign-out (this device, another
+    -- device, or "sign out everywhere").
     select s.created_at into started from auth.sessions s where s.id = sid and s.user_id = uid;
     if not found then
       return 'revoked';
     end if;
-    verified := true;
+  else
+    select a.started_at into started from public.session_activity a where a.session_id = sid and a.user_id = uid;
+    if not found then
+      return 'active';
+    end if;
   end if;
 
-  select a.last_seen_at into seen
-  from public.session_activity a
-  where a.session_id = sid and a.user_id = uid;
-  if found then
-    return case when seen > now() - public.session_idle_limit() then 'active' else 'expired' end;
-  end if;
-
-  -- No activity reported yet: only a session that signed in within the idle
-  -- limit counts (the app reports activity right after sign-in).
-  if verified and started <= now() - public.session_idle_limit() then
-    return 'expired';
-  end if;
-  return 'active';
+  return case when started > now() - public.session_max_age() then 'active' else 'expired' end;
 end;
 $$;
 
@@ -104,8 +106,9 @@ as $$
   select public.session_state() = 'active';
 $$;
 
--- Called by the app on sign-in, on page load and while the user is active.
--- Raises SESSION_EXPIRED / SESSION_REVOKED instead of reviving a session.
+-- Called by the app on sign-in, page load and when a tab is reopened.
+-- Raises SESSION_EXPIRED / SESSION_REVOKED instead of extending a session:
+-- calling it never adds time.
 create or replace function public.touch_session()
 returns void
 language plpgsql
@@ -119,36 +122,37 @@ begin
   if state = 'revoked' then
     raise exception 'SESSION_REVOKED' using hint = 'This session has been signed out. Sign in again.';
   elsif state = 'expired' then
-    raise exception 'SESSION_EXPIRED' using hint = 'Signed out after 9 minutes of inactivity. Sign in again.';
+    raise exception 'SESSION_EXPIRED' using hint = 'Sessions end 5 minutes after sign-in. Sign in again.';
   end if;
 
-  insert into public.session_activity (session_id, user_id, last_seen_at)
+  -- Remember the first time this session was seen (used only if
+  -- auth.sessions can't be read). Never moved forward.
+  insert into public.session_activity (session_id, user_id, started_at)
   values ((auth.jwt() ->> 'session_id')::uuid, auth.uid(), now())
-  on conflict (session_id) do update
-    set last_seen_at = excluded.last_seen_at
-    where public.session_activity.user_id = excluded.user_id;
+  on conflict (session_id) do nothing;
 
-  -- Forget this user's long-idle sessions. Without a row, a session older
-  -- than the idle limit is still 'expired', so nothing is revived.
+  -- With auth.sessions readable these rows decide nothing, so drop old ones.
   if to_regclass('auth.sessions') is not null and has_table_privilege('auth.sessions', 'select') then
     delete from public.session_activity a
-    where a.user_id = auth.uid() and a.last_seen_at < now() - interval '7 days';
+    where a.user_id = auth.uid() and a.started_at < now() - interval '1 day';
   end if;
 end;
 $$;
 
-revoke all on function public.session_idle_limit() from public, anon, authenticated;
+revoke all on function public.session_max_age() from public, anon, authenticated;
 revoke all on function public.session_state() from public, anon, authenticated;
 revoke all on function public.session_is_active() from public, anon;
 revoke all on function public.touch_session() from public, anon;
 grant execute on function public.session_is_active() to authenticated;
 grant execute on function public.touch_session() to authenticated;
 
--- Optional (recommended): also refuse to *refresh* an idle session, so its
--- refresh token is useless even if the tab was closed before it could sign
--- out. Enable in Authentication -> Hooks -> Customize Access Token (JWT)
--- Claims -> Postgres -> public.idle_timeout_access_token_hook. New sign-ins
--- are never affected: a new session has no activity row yet.
+-- Optional (recommended): Supabase Auth also refuses to issue or refresh a
+-- token for a session older than 5 minutes, so its refresh token is useless
+-- even if the tab was closed. Enable in Authentication -> Hooks ->
+-- Customize Access Token (JWT) Claims -> Postgres ->
+-- public.idle_timeout_access_token_hook. (The name is kept from the
+-- 9-minute version so an already-enabled hook keeps working.) A new sign-in
+-- is never affected: its session was created a moment ago.
 create or replace function public.idle_timeout_access_token_hook(event jsonb)
 returns jsonb
 language plpgsql
@@ -158,15 +162,20 @@ set search_path = ''
 as $$
 declare
   raw_sid text := event -> 'claims' ->> 'session_id';
+  started timestamptz;
 begin
-  if raw_sid ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' and exists (
-    select 1 from public.session_activity a
-    where a.session_id = raw_sid::uuid
-      and a.last_seen_at <= now() - public.session_idle_limit()
-  ) then
-    return jsonb_build_object('error', jsonb_build_object(
-      'http_code', 401,
-      'message', 'Your session has expired due to 9 minutes of inactivity. Please log in again to continue.'));
+  if raw_sid ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    if to_regclass('auth.sessions') is not null and has_table_privilege('auth.sessions', 'select') then
+      select s.created_at into started from auth.sessions s where s.id = raw_sid::uuid;
+    end if;
+    if started is null then
+      select a.started_at into started from public.session_activity a where a.session_id = raw_sid::uuid;
+    end if;
+    if started is not null and started <= now() - public.session_max_age() then
+      return jsonb_build_object('error', jsonb_build_object(
+        'http_code', 401,
+        'message', 'Your session has expired. Please log in again to continue.'));
+    end if;
   end if;
   return event;
 end;
@@ -180,6 +189,9 @@ begin
   end if;
 end;
 $$;
+
+-- Replaced by session_max_age() (9-minute inactivity version).
+drop function if exists public.session_idle_limit();
 
 -- ---------------------------------------------------------------------
 -- 2. Profiles (one row per auth user)
