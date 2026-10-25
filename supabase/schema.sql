@@ -13,14 +13,14 @@
 create extension if not exists pg_trgm with schema extensions;
 
 -- ---------------------------------------------------------------------
--- 1. Sessions: automatic sign-out 5 minutes after sign-in
+-- 1. Sessions: automatic sign-out 10 minutes after sign-in
 -- ---------------------------------------------------------------------
--- Every session ends 5 minutes after the password sign-in, whatever the
+-- Every session ends 10 minutes after the password sign-in, whatever the
 -- user is doing: activity does not extend it. The browser signs out at that
 -- moment, but a timer in the page is not a security boundary, so every
 -- table and storage policy below also requires session_is_active(), which
 -- counts from the session's own sign-in time in auth.sessions. A session
--- older than 5 minutes, or one that was signed out (its auth.sessions row is
+-- older than 10 minutes, or one that was signed out (its auth.sessions row is
 -- gone), can no longer read or change anything, even with an access token
 -- that has not expired yet. The user has to sign in again.
 create table if not exists public.session_activity (
@@ -52,7 +52,7 @@ language sql
 immutable
 set search_path = ''
 as $$
-  select interval '5 minutes';
+  select interval '10 minutes';
 $$;
 
 -- When the session in the caller's verified JWT signed in. Normally read
@@ -122,7 +122,7 @@ begin
   if state = 'revoked' then
     raise exception 'SESSION_REVOKED' using hint = 'This session has been signed out. Sign in again.';
   elsif state = 'expired' then
-    raise exception 'SESSION_EXPIRED' using hint = 'Sessions end 5 minutes after sign-in. Sign in again.';
+    raise exception 'SESSION_EXPIRED' using hint = 'Sessions end 10 minutes after sign-in. Sign in again.';
   end if;
 
   -- Remember the first time this session was seen (used only if
@@ -147,7 +147,7 @@ grant execute on function public.session_is_active() to authenticated;
 grant execute on function public.touch_session() to authenticated;
 
 -- Optional (recommended): Supabase Auth also refuses to issue or refresh a
--- token for a session older than 5 minutes, so its refresh token is useless
+-- token for a session older than 10 minutes, so its refresh token is useless
 -- even if the tab was closed. Enable in Authentication -> Hooks ->
 -- Customize Access Token (JWT) Claims -> Postgres ->
 -- public.idle_timeout_access_token_hook. (The name is kept from the

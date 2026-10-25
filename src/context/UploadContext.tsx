@@ -104,7 +104,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
 
   const isUploading = items.some((i) => i.status === 'queued' || isActive(i));
 
-  // The session ended (sign-out or the 5-minute limit): stop uploads that are
+  // The session ended (sign-out or the 10-minute limit): stop uploads that are
   // still running instead of letting them fail against a revoked session.
   useEffect(() => {
     const running = controllers.current;

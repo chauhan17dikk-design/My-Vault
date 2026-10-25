@@ -2,7 +2,7 @@ import type { Session } from '@supabase/supabase-js';
 
 /** Every session ends this long after sign-in, whatever the user is doing.
  *  Keep in sync with public.session_max_age() in supabase/schema.sql. */
-export const SESSION_MAX_AGE_MS = 5 * 60 * 1000;
+export const SESSION_MAX_AGE_MS = 10 * 60 * 1000;
 
 /** Why a session ended without the user signing out in this tab. */
 export type EndReason = 'timeout' | 'revoked' | 'signout';
@@ -47,7 +47,7 @@ export function writeSessionStart(sid: string, at: number) {
   safe(() => localStorage.setItem(START_KEY, JSON.stringify({ sid, at } satisfies StartRecord)), undefined);
 }
 
-/** True when this session is known to be past its 5 minutes (or was ended),
+/** True when this session is known to be past its 10 minutes (or was ended),
  *  e.g. on a reload or when returning to a hidden tab. */
 export function isSessionExpired(sid: string, now = Date.now()): boolean {
   const at = readSessionStart(sid);

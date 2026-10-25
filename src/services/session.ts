@@ -1,7 +1,7 @@
 import { supabase } from '@/lib/supabase';
 
 /**
- * Ask the server whether this session is still within its 5 minutes
+ * Ask the server whether this session is still within its 10 minutes
  * (public.touch_session in schema.sql). Returns why the server considers the
  * session over, or null if it is still active.
  *

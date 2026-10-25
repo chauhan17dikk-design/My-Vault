@@ -52,7 +52,7 @@ bug in the UI can't leak another user's files.
 **`public.profiles`**: `full_name`, `avatar_path`, `preferences jsonb` (view, page size, theme — synced across devices), `storage_quota_bytes`.
 
 **`public.session_activity`**: `session_id` (the Supabase Auth session), `user_id`,
-`started_at`. Used only by the session functions for the 5-minute session limit
+`started_at`. Used only by the session functions for the 10-minute session limit
 (section 4), as a fallback record of when a session was first seen. Clients have
 no direct access to it.
 
@@ -102,17 +102,17 @@ original name is kept in the database.
    new password for a genuine recovery-link session. Signed-in users change their
    password in Settings, which re-verifies the current password first.
 5. Settings also offers "sign out everywhere" (revokes all refresh tokens).
-6. **Automatic sign-out 5 minutes after sign-in**, whatever you are doing (see below).
+6. **Automatic sign-out 10 minutes after sign-in**, whatever you are doing (see below).
 
-### Session limit (5 minutes)
+### Session limit (10 minutes)
 
-Every session ends **5 minutes after the password sign-in**, in every situation.
+Every session ends **10 minutes after the password sign-in**, in every situation.
 Mouse, keyboard, scroll and touch activity do **not** extend it. The two-step code
-step counts toward the 5 minutes.
+step counts toward the 10 minutes.
 
 **In the browser** (`src/hooks/useSessionTimeout.ts`, `src/lib/session.ts`,
 wired up in `src/context/AuthContext.tsx`):
-- Each tab keeps one timer, set for exactly 5 minutes after sign-in. The sign-in
+- Each tab keeps one timer, set for exactly 10 minutes after sign-in. The sign-in
   time is shared between tabs in `localStorage` (`vault.session-start`, no
   credentials in it), so every tab signs out at the same moment.
 - When the time is up, the tab hides the protected UI immediately, clears the
@@ -122,7 +122,7 @@ wired up in `src/context/AuthContext.tsx`):
 - The login page opens without any message. Uploads that were still running
   are stopped. After signing in you return to the page you were on.
 - "Keep me signed in" doesn't change the limit. It only decides whether a
-  session that is still inside its 5 minutes survives closing the browser.
+  session that is still inside its 10 minutes survives closing the browser.
 - Other tabs are told through a `storage` event and sign out too. Manual sign-out
   is shared the same way.
 - Browsers delay timers in background tabs, so the deadline is also checked when
@@ -133,7 +133,7 @@ wired up in `src/context/AuthContext.tsx`):
 security boundary:
 - Every table and storage policy also requires `session_is_active()`. It is true
   only if the session in the caller's JWT still exists in `auth.sessions` (it has
-  not been signed out) and was created less than 5 minutes ago. The time comes
+  not been signed out) and was created less than 10 minutes ago. The time comes
   from Supabase Auth's own record, so nothing the browser sends can extend it.
 - An expired or signed-out session can't read, list, sign, upload, change or
   delete anything, even with an access token that has not expired yet.
@@ -150,7 +150,10 @@ Signed preview and download URLs that were already issued stay valid until they
 expire (at most 1 hour; avatars 24 hours), as before. Uploads that take longer
 than the time left in the session are stopped. To change the limit, edit
 `SESSION_MAX_AGE_MS` in `src/lib/session.ts` **and** `session_max_age()` in
-`schema.sql`.
+`schema.sql`. When making it **longer**, run the schema in Supabase first and
+then deploy the frontend. When making it **shorter**, deploy the frontend first.
+Otherwise, for a few minutes the database cuts off sessions the page still shows
+as signed in, and the vault looks empty.
 
 ## 5. Security model (RLS)
 
@@ -162,7 +165,7 @@ than the time left in the session are stopped. To change the limit, edit
 | `storage.objects` | Bucket `vault-files` only. The first folder must equal `auth.uid()`. Uploads **and renames/overwrites** are only allowed into known subfolders. Executable extensions are blocked. Resumable (TUS) uploads go through the same policies. |
 | `anon` role | No table or function access at all |
 | `vault_stats()` | `security invoker`, runs under the caller's RLS |
-| All of the above | Also require `session_is_active()`: the JWT's session still exists and was created less than 5 minutes ago |
+| All of the above | Also require `session_is_active()`: the JWT's session still exists and was created less than 10 minutes ago |
 | `session_activity` | No client access. Written only through `touch_session()`, which never extends a session |
 
 The client never supplies the user ID used for authorization. It comes from the
@@ -178,8 +181,8 @@ object path.
 (Postgres compiled to WASM) with stand-ins for Supabase's `auth`/`storage`
 schemas. The tests cover cross-user reads, writes, overwrites and deletes, path
 spoofing, quota tampering, immutable columns, blocked file types, anonymous
-access, the Videos category, the **5-minute session limit** (sessions
-older than 5 minutes and signed-out sessions are locked out of tables and storage,
+access, the Videos category, the **10-minute session limit** (sessions
+older than 10 minutes and signed-out sessions are locked out of tables and storage,
 activity never extends a session, and the Auth hook refuses their tokens),
 upgrading from the 9-minute inactivity version, and **upgrading a vault
 created with the first schema** (`supabase/tests/fixtures/schema-v1.sql`) without losing rows or the
@@ -242,9 +245,9 @@ bucket size limit.
    (Pro plan).
 10. Recommended: **refuse tokens for expired sessions.** Go to *Authentication →
     Hooks → Customize Access Token (JWT) Claims*, choose **Postgres**, and select
-    `public.idle_timeout_access_token_hook`. Without it the 5-minute limit is
+    `public.idle_timeout_access_token_hook`. Without it the 10-minute limit is
     still enforced on all data and files (section 4). The hook also makes a
-    closed tab's refresh token stop working after 5 minutes. New sign-ins are
+    closed tab's refresh token stop working after 10 minutes. New sign-ins are
     never affected. If you already use a custom access token hook, merge the
     check into it instead.
 
@@ -265,7 +268,7 @@ earlier version of this project (before Videos):
    - replaces the storage insert/update policies (allow `videos/`; renames can
      no longer produce a blocked extension or unknown folder),
    - keeps the bucket private **without** resetting a size limit you raised,
-   - adds the 5-minute session limit: the `session_activity` table, the
+   - adds the 10-minute session limit: the `session_activity` table, the
      session functions and the optional Auth hook, and adds
      `session_is_active()` to every table and storage policy. A vault on the
      9-minute inactivity version is upgraded in place (`last_seen_at` becomes
@@ -275,7 +278,7 @@ earlier version of this project (before Videos):
 
    **Deploy order for the session limit: deploy the new frontend first, then
    run the schema.** The new frontend works against the old schema (it ignores a
-   missing `touch_session()`). After the upgrade, sessions older than 5 minutes
+   missing `touch_session()`). After the upgrade, sessions older than 10 minutes
    are signed out. Sign in again.
 3. Deploy the new frontend **after** step 2. The new build reads
    `duration_seconds`, so running it against the old schema fails to list
@@ -354,7 +357,7 @@ src/
     ui/                   Button, Input, Modal, Menu, ConfirmDialog, EmptyState, Skeleton…
   context/                Auth, Upload queue, File actions
   hooks/                  useFiles (infinite query), useFileFilters (URL state), useProfile,
-                          useSessionTimeout (sign-out 5 minutes after sign-in)
+                          useSessionTimeout (sign-out 10 minutes after sign-in)
   services/               files, upload, profile, session (all Supabase calls)
   lib/                    supabase client, categories registry, views, pdf, thumbnails,
                           preview rules, errors, query cache, session (timeout state shared by tabs)

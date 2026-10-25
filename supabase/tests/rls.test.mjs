@@ -205,7 +205,7 @@ await expectOk(
   (r) => r.rows[0].public === false && Number(r.rows[0].file_size_limit) === 5368709120,
 );
 
-// ---- Session limit: 5 minutes after sign-in, activity does not extend it ----
+// ---- Session limit: 10 minutes after sign-in, activity does not extend it ----
 // Separate sessions per scenario so A's main session stays active.
 const S = {
   fresh: 'a5e55100-0000-4000-8000-0000000000a1',
@@ -215,8 +215,8 @@ const S = {
 };
 await db.exec('reset role');
 await db.exec(`insert into auth.sessions (id, user_id, created_at) values
-  ('${S.fresh}','${A}', now()), ('${S.almost}','${A}', now() - interval '4 minutes 50 seconds'),
-  ('${S.old}','${A}', now() - interval '5 minutes 1 second'), ('${S.revoked}','${A}', now())`);
+  ('${S.fresh}','${A}', now()), ('${S.almost}','${A}', now() - interval '9 minutes 50 seconds'),
+  ('${S.old}','${A}', now() - interval '10 minutes 1 second'), ('${S.revoked}','${A}', now())`);
 
 await as(A, 'authenticated', 'aal2', S.fresh);
 await expectOk('session just signed in can read', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
@@ -226,11 +226,11 @@ await db.exec('reset role');
 await expectOk('first-seen time recorded once', `select count(*)::int n from public.session_activity where session_id='${S.fresh}'`, (r) => r.rows[0].n === 1);
 
 await as(A, 'authenticated', 'aal2', S.almost);
-await expectOk('session 4m50s after sign-in is still active', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
+await expectOk('session 9m50s after sign-in is still active', `select count(*)::int n from public.files`, (r) => r.rows[0].n > 0);
 await expectOk('touching it adds no time', `select public.touch_session()`);
-await db.exec(`reset role; update auth.sessions set created_at = now() - interval '5 minutes 1 second' where id='${S.almost}'`);
+await db.exec(`reset role; update auth.sessions set created_at = now() - interval '10 minutes 1 second' where id='${S.almost}'`);
 await as(A, 'authenticated', 'aal2', S.almost);
-await expectOk('recent activity does not keep a 5-minute-old session alive', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await expectOk('recent activity does not keep a 10-minute-old session alive', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
 await expectErr('touch_session refuses to extend it', `select public.touch_session()`, /SESSION_EXPIRED/);
 
 await as(A, 'authenticated', 'aal2', S.old);
@@ -270,7 +270,7 @@ await expectErr('anon cannot touch a session', `select public.touch_session()`, 
 
 await db.exec('reset role');
 const hook = (sid) => `select public.idle_timeout_access_token_hook('{"claims":{"sub":"${A}","session_id":"${sid}"}}'::jsonb) r`;
-await expectOk('hook refuses a token for a session older than 5 minutes', hook(S.old), (r) => r.rows[0].r.error?.http_code === 401);
+await expectOk('hook refuses a token for a session older than 10 minutes', hook(S.old), (r) => r.rows[0].r.error?.http_code === 401);
 await expectOk('hook passes a fresh session through unchanged', hook(S.fresh), (r) => r.rows[0].r.claims?.session_id === S.fresh && !r.rows[0].r.error);
 await expectOk('hook allows a brand-new session', hook('a5e55100-0000-4000-8000-0000000000ff'), (r) => !r.rows[0].r.error);
 await expectOk('hook tolerates a missing session_id', `select public.idle_timeout_access_token_hook('{"claims":{}}'::jsonb) r`, (r) => !r.rows[0].r.error);
@@ -329,7 +329,7 @@ await db.exec(schema);
 await expectOk('upgrade renames last_seen_at to started_at and keeps rows', `select count(*)::int n from public.session_activity where session_id='${OLD_SID}' and started_at is not null`, (r) => r.rows[0].n === 1);
 await expectOk('upgrade keeps files', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 1);
 await as(A, 'authenticated', 'aal2', OLD_SID);
-await expectOk('after upgrade a session older than 5 minutes is cut off despite recent activity', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
+await expectOk('after upgrade a session older than 10 minutes is cut off despite recent activity', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 0);
 await as(A);
 await expectOk('after upgrade a fresh session works', `select count(*)::int n from public.files`, (r) => r.rows[0].n === 1);
 await expectOk('after upgrade touch_session works', `select public.touch_session()`);
